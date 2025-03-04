@@ -1,7 +1,7 @@
 | Supported Targets | ESP32-S2 | ESP32-S3 |
 | ----------------- | -------- | -------- |
 
-# USB CDC-ACM Host Driver Example
+# Tyt MD-9600 BLE-UART Bridge
 
 (See the README.md file in the upper level 'examples' directory for more information about examples.)
 
