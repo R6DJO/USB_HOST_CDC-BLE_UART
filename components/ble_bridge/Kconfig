@@ -1,0 +1,10 @@
+menu "BLE Bridge (Nordic UART Service)"
+
+    config BLE_DEVICE_NAME
+        string "Advertised BLE device name"
+        default "DMR-RADIO"
+        help
+            GAP device name advertised by the Nordic UART Service peripheral.
+            Clients filter/connect to this name.
+
+endmenu

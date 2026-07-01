@@ -17,6 +17,9 @@ CONFIG_BT_NIMBLE_GATT_MAX_PROCS=8
 # Legacy (non-extended) advertising is used by the Nordic UART service.
 # CONFIG_BT_NIMBLE_EXT_ADV is not set
 
+# --- BLE Bridge (Nordic UART Service) ---
+CONFIG_BLE_DEVICE_NAME="DMR-RADIO"
+
 # --- Nordic UART component ---
 CONFIG_NORDIC_UART_RX_BUFFER_SIZE=4096
 
@@ -25,6 +28,12 @@ CONFIG_MSG_ROUTER_BUF_SIZE=8192
 # Per-sink async delivery (variant C): private queue + dedicated task per sink
 CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE=4096
 CONFIG_MSG_ROUTER_SINK_TASK_STACK=3072
+
+# --- USB CDC (radio): Tyt MD-9600 0x1FC9:0x0094 @ 115200 8N1 ---
+CONFIG_USB_CDC_DEVICE_VID=0x1FC9
+CONFIG_USB_CDC_DEVICE_PID=0x0094
+CONFIG_USB_CDC_BAUDRATE=115200
+CONFIG_USB_CDC_TX_TIMEOUT_MS=1000
 
 # --- UART Bridge (pins/rates; adjust to your board wiring) ---
 # UART Radio: auto-baud probes 9600 then 115200 via 'AT'

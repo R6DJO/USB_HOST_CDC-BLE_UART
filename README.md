@@ -114,7 +114,8 @@ Standard **Nordic UART Service**:
 | RX (peer → us, write)  | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` |
 | TX (us → peer, notify) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` |
 
-Advertised device name: **`DMR-RADIO`**.
+Advertised device name: **`DMR-RADIO`** (set via *Component config → BLE Bridge* →
+`CONFIG_BLE_DEVICE_NAME`).
 
 ## Hardware required
 
@@ -194,13 +195,14 @@ Bridge* / *Message Router*):
 | `CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE`  | `4096`      | Per-sink delivery ring buffer (bytes); drops newest on overflow |
 | `CONFIG_MSG_ROUTER_SINK_TASK_STACK`  | `3072`      | Stack for each sink's dedicated delivery task |
 
-USB CDC parameters are set in [`main/main.c`](main/main.c): **115200 8N1**, DTR
-asserted, RTS deasserted. Adjust `MD9600_USB_DEVICE_VID` / `PID` there if your
-radio reports different IDs.
+USB CDC parameters are set under *Component config → USB CDC* (`idf.py
+menuconfig`): radio VID/PID (default `0x1FC9:0x0094`), line-coding baud rate
+(default **115200 8N1**, DTR asserted, RTS deasserted) and the TX timeout. The
+pinned values also live in [`sdkconfig.defaults`](sdkconfig.defaults).
 
 To change any of the above, edit `sdkconfig.defaults` (or run `idf.py menuconfig`
-→ *Component config* → *Bluetooth* / *UART Bridge* / *Message Router*) and
-rebuild.
+→ *Component config* → *Bluetooth* / *USB CDC* / *UART Bridge* / *Message
+Router*) and rebuild.
 
 ## Components
 
@@ -209,8 +211,10 @@ The firmware is split into three local components under
 
 | Component | Role |
 |-----------|------|
-| [`nordic_uart_multi`](components/nordic_uart_multi) | Multi-connection BLE Nordic UART Service peripheral |
+| [`nordic_uart_multi`](components/nordic_uart_multi) | Multi-connection BLE Nordic UART Service peripheral (driver, router-free) |
+| [`ble_bridge`](components/ble_bridge)                  | BLE<->router glue: starts NUS + BLE sink + `ble2rt` task (NUS RX -> router) |
 | [`msg_router`](components/msg_router)              | Central routing queue + `msg_routing` task + per-sink async queues + per-source `switch` |
+| [`usb_cdc`](components/usb_cdc)                    | USB CDC-ACM (Tyt MD-9600 radio): open/line-coding/auto-reconnect + TX sink |
 | [`uart_bridge`](components/uart_bridge)            | UART Radio (auto-baud) + UART Lora (fixed baud) |
 
 ### `msg_router`
@@ -325,21 +329,21 @@ After flashing, connect the radio / UART devices and pair a BLE client to
 
 ```
 I (xxx) MSG_ROUTER: Initialized (buffer 8192 bytes)
+I (xxx) USB_CDC: Installing USB Host
+I (xxx) USB_CDC: Installing CDC-ACM driver
 I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), probing baud...
 I (xxx) UART_LORA:  Driver installed (UART2 TX=GPIO21 RX=GPIO47 @9600 bps)
-I (xxx) MSG_ROUTER: Routing task started
 I (xxx) NORDIC_UART: Started (max 4 connections)
-I (xxx) DMR-RADIO: Installing USB Host
-I (xxx) DMR-RADIO: Installing CDC-ACM driver
+I (xxx) MSG_ROUTER: Routing task started
+I (xxx) USB_CDC: Opening CDC ACM device 0x1FC9:0x0094...
 I (xxx) UART_RADIO: Baud detected: 115200 bps
 I (xxx) UART_RADIO: RX task started (115200 bps)
-I (xxx) DMR-RADIO: Opening CDC ACM device 0x1FC9:0x0094...
-I (xxx) DMR-RADIO: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
-I (xxx) DMR-RADIO: Connected CDC ACM device 0x1FC9:0x0094 (0 BLE peer(s))...
+I (xxx) USB_CDC: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
+I (xxx) USB_CDC: Connected CDC ACM device 0x1FC9:0x0094
 I (xxx) NORDIC_UART: Connected handle=0  total=1/4
 I (xxx) NORDIC_UART: Subscribe handle=0 notify=1
-I (xxx) USB->ROUTER:  radio -> 5 byte(s)
-I (xxx) BLE->ROUTER:  peer=0 -> 9 byte(s)
+I (xxx) USB_CDC: radio -> 5 byte(s)
+I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
 ```
 
 ## Notes / limitations

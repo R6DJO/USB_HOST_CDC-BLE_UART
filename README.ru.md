@@ -119,7 +119,8 @@ B/C/D — но не до A**. Чтобы полностью изолироват
 | RX (клиент → устройство, write)  | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` |
 | TX (устройство → клиент, notify) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` |
 
-Рекламируемое имя устройства: **`DMR-RADIO`**.
+Рекламируемое имя устройства: **`DMR-RADIO`** (меняется в *Component config →
+BLE Bridge* → `CONFIG_BLE_DEVICE_NAME`).
 
 ## Требуемое оборудование
 
@@ -199,13 +200,14 @@ Bridge* / *Message Router*):
 | `CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE`  | `4096`      | Приватный буфер доставки per-sink (байт); drop-newest при переполнении |
 | `CONFIG_MSG_ROUTER_SINK_TASK_STACK`  | `3072`      | Стек задачи доставки каждого sink'а |
 
-Параметры USB CDC задаются в [`main/main.c`](main/main.c): **115200 8N1**, DTR
-активен, RTS неактивен. При необходимости поменяйте `MD9600_USB_DEVICE_VID` /
-`PID` там же, если рация сообщает другие ID.
+Параметры USB CDC задаются в *Component config → USB CDC* (`idf.py
+menuconfig`): VID/PID рации (по умолч. `0x1FC9:0x0094`), скорость line coding
+(по умолч. **115200 8N1**, DTR активен, RTS неактивен) и таймаут TX. Pinned-значения
+также лежат в [`sdkconfig.defaults`](sdkconfig.defaults).
 
 Чтобы изменить любое из этих значений, отредактируйте `sdkconfig.defaults` (или
-выполните `idf.py menuconfig` → *Component config* → *Bluetooth* / *UART
-Bridge* / *Message Router*) и пересоберите.
+выполните `idf.py menuconfig` → *Component config* → *Bluetooth* / *USB CDC* /
+*UART Bridge* / *Message Router*) и пересоберите.
 
 ## Компоненты
 
@@ -214,8 +216,10 @@ Bridge* / *Message Router*) и пересоберите.
 
 | Компонент | Роль |
 |-----------|------|
-| [`nordic_uart_multi`](components/nordic_uart_multi) | BLE-периферия Nordic UART Service с мульти-соединением |
+| [`nordic_uart_multi`](components/nordic_uart_multi) | BLE-периферия Nordic UART Service с мульти-соединением (драйвер, не зависит от роутера) |
+| [`ble_bridge`](components/ble_bridge)                  | Глю-слой BLE↔роутер: старт NUS + BLE-sink + задача `ble2rt` (NUS RX → роутер) |
 | [`msg_router`](components/msg_router)              | Центральная очередь маршрутизации + задача `msg_routing` + асинхронные очереди per-sink + per-source `switch` |
+| [`usb_cdc`](components/usb_cdc)                    | USB CDC-ACM (рация Tyt MD-9600): open/line-coding/авто-реконнект + TX-sink |
 | [`uart_bridge`](components/uart_bridge)            | UART Radio (авто-бауд) + UART Lora (фикс. скорость) |
 
 ### `msg_router`
@@ -332,21 +336,21 @@ idf.py -p PORT flash monitor
 
 ```
 I (xxx) MSG_ROUTER: Initialized (buffer 8192 bytes)
+I (xxx) USB_CDC: Installing USB Host
+I (xxx) USB_CDC: Installing CDC-ACM driver
 I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), probing baud...
 I (xxx) UART_LORA:  Driver installed (UART2 TX=GPIO21 RX=GPIO47 @9600 bps)
-I (xxx) MSG_ROUTER: Routing task started
 I (xxx) NORDIC_UART: Started (max 4 connections)
-I (xxx) DMR-RADIO: Installing USB Host
-I (xxx) DMR-RADIO: Installing CDC-ACM driver
+I (xxx) MSG_ROUTER: Routing task started
+I (xxx) USB_CDC: Opening CDC ACM device 0x1FC9:0x0094...
 I (xxx) UART_RADIO: Baud detected: 115200 bps
 I (xxx) UART_RADIO: RX task started (115200 bps)
-I (xxx) DMR-RADIO: Opening CDC ACM device 0x1FC9:0x0094...
-I (xxx) DMR-RADIO: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
-I (xxx) DMR-RADIO: Connected CDC ACM device 0x1FC9:0x0094 (0 BLE peer(s))...
+I (xxx) USB_CDC: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
+I (xxx) USB_CDC: Connected CDC ACM device 0x1FC9:0x0094
 I (xxx) NORDIC_UART: Connected handle=0  total=1/4
 I (xxx) NORDIC_UART: Subscribe handle=0 notify=1
-I (xxx) USB->ROUTER:  radio -> 5 byte(s)
-I (xxx) BLE->ROUTER:  peer=0 -> 9 byte(s)
+I (xxx) USB_CDC: radio -> 5 byte(s)
+I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
 ```
 
 ## Замечания / ограничения

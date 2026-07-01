@@ -1,0 +1,35 @@
+menu "USB CDC (radio)"
+
+    config USB_CDC_DEVICE_VID
+        hex "USB Vendor ID"
+        default 0x1FC9
+        range 0x0000 0xFFFF
+        help
+            VID of the CDC-ACM device to open. Default is NXP/Tyt MD-9600.
+
+    config USB_CDC_DEVICE_PID
+        hex "USB Product ID"
+        default 0x0094
+        range 0x0000 0xFFFF
+        help
+            PID of the CDC-ACM device to open. Default is the MD-9600 CDC
+            interface.
+
+    config USB_CDC_BAUDRATE
+        int "Line coding baud rate"
+        default 115200
+        range 1200 4000000
+        help
+            DTE rate applied via cdc_acm_host_line_coding_set() (8 data bits,
+            no parity, 1 stop bit).
+
+    config USB_CDC_TX_TIMEOUT_MS
+        int "CDC TX blocking timeout (ms)"
+        default 1000
+        range 100 10000
+        help
+            How long the USB CDC sink waits for a bulk TX to complete before
+            giving up on a frame. It is held under cdc_mutex, so this also
+            bounds how long a disconnect handler is delayed.
+
+endmenu

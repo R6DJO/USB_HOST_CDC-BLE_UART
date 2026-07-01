@@ -2610,6 +2610,12 @@ CONFIG_WIFI_PROV_STA_ALL_CHANNEL_SCAN=y
 # end of Wi-Fi Provisioning Manager
 
 #
+# BLE Bridge (Nordic UART Service)
+#
+CONFIG_BLE_DEVICE_NAME="DMR-RADIO"
+# end of BLE Bridge (Nordic UART Service)
+
+#
 # Message Router
 #
 CONFIG_MSG_ROUTER_BUF_SIZE=8192
@@ -2646,6 +2652,15 @@ CONFIG_UART_LORA_BAUDRATE=9600
 CONFIG_UART_LORA_BUF_SIZE=512
 # end of UART Lora (fixed baud)
 # end of UART Bridge
+
+#
+# USB CDC (radio)
+#
+CONFIG_USB_CDC_DEVICE_VID=0x1FC9
+CONFIG_USB_CDC_DEVICE_PID=0x0094
+CONFIG_USB_CDC_BAUDRATE=115200
+CONFIG_USB_CDC_TX_TIMEOUT_MS=1000
+# end of USB CDC (radio)
 # end of Component config
 
 # CONFIG_IDF_EXPERIMENTAL_FEATURES is not set
