@@ -186,6 +186,8 @@ Bridge* / *Message Router*):
 | `CONFIG_UART_RADIO_TX_GPIO`     | `17`        | TX → AT radio RX |
 | `CONFIG_UART_RADIO_RX_GPIO`     | `18`        | RX ← AT radio TX |
 | `CONFIG_UART_RADIO_BUF_SIZE`    | `512`       | Radio UART scratch buffer |
+| `CONFIG_UART_RADIO_STARTUP_DELAY_MS` | `5000` | Delay before auto-baud starts (ms) |
+| `CONFIG_UART_RADIO_PROBE_ATTEMPTS`   | `3`    | Auto-baud rounds, then it gives up |
 | `CONFIG_UART_LORA_NUM`          | `2` (UART2) | UART peripheral for Lora (must differ from Radio) |
 | `CONFIG_UART_LORA_TX_GPIO`      | `21`        | TX → Lora RX |
 | `CONFIG_UART_LORA_RX_GPIO`      | `47`        | RX ← Lora TX |
@@ -268,9 +270,13 @@ Wraps the two UART links. Each one installs the UART driver, registers its sink
 with the router, and runs an RX task that forwards received bytes into the
 router.
 
-- **UART Radio** (`uart_radio_init()`): auto-baud task probes 9600/115200 by an
-  `AT`→`OK` handshake; once a baud is found it spawns the RX task. Before that,
-  outbound frames are dropped (`uart_radio_baud()` returns 0).
+- **UART Radio** (`uart_radio_init()`): after `CONFIG_UART_RADIO_STARTUP_DELAY_MS`
+  (default 5 s) the auto-baud task probes 9600/115200 with an `AT`→`OK` handshake,
+  then sends `AT+SYNCOVER` and expects `OK`; only then is the baud published and
+  the RX task started (the bridge goes live). Before that, outbound frames to
+  Radio are dropped (`b->baud` == 0). After `CONFIG_UART_RADIO_PROBE_ATTEMPTS`
+  failed rounds the task gives up -- if the radio hasn't answered by then, its
+  bridge stays disabled.
 - **UART Lora** (`uart_lora_init()`): fixed baud from config, RX task always on.
 
 ### `nordic_uart_multi`
@@ -331,17 +337,19 @@ After flashing, connect the radio / UART devices and pair a BLE client to
 I (xxx) MSG_ROUTER: Initialized (buffer 8192 bytes)
 I (xxx) USB_CDC: Installing USB Host
 I (xxx) USB_CDC: Installing CDC-ACM driver
-I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), probing baud...
+I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), auto-baud in 5000 ms...
 I (xxx) UART_LORA:  Driver installed (UART2 TX=GPIO21 RX=GPIO47 @9600 bps)
 I (xxx) NORDIC_UART: Started (max 4 connections)
 I (xxx) MSG_ROUTER: Routing task started
 I (xxx) USB_CDC: Opening CDC ACM device 0x1FC9:0x0094...
-I (xxx) UART_RADIO: Baud detected: 115200 bps
-I (xxx) UART_RADIO: RX task started (115200 bps)
 I (xxx) USB_CDC: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
 I (xxx) USB_CDC: Connected CDC ACM device 0x1FC9:0x0094
 I (xxx) NORDIC_UART: Connected handle=0  total=1/4
 I (xxx) NORDIC_UART: Subscribe handle=0 notify=1
+I (xxx) UART_RADIO: Startup delay 5000 ms before probing
+I (xxx) UART_RADIO: AT OK at 115200 bps, sending init
+I (xxx) UART_RADIO: Initialized @ 115200 bps, bridge active
+I (xxx) UART_RADIO: RX task started (115200 bps)
 I (xxx) USB_CDC: radio -> 5 byte(s)
 I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
 ```
@@ -352,9 +360,12 @@ I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
   interfaces. To make a source deliver only to specific destinations, edit the
   `switch` in [`msg_router.c`](components/msg_router/src/msg_router.c) (see
   [Routing](#routing)).
-- **UART Radio auto-baud:** until an `AT`→`OK` handshake succeeds, the Radio
-  UART only listens and outbound frames to it are dropped. Re-detection is
-  automatic on hot-plug.
+- **UART Radio auto-baud:** after `CONFIG_UART_RADIO_STARTUP_DELAY_MS` the task
+  sends `AT` (to detect 9600/115200) then `AT+SYNCOVER` (init); the bridge is
+  activated only after `OK` to both. Until then, outbound frames to Radio are
+  dropped. After `CONFIG_UART_RADIO_PROBE_ATTEMPTS` failed attempts the task
+  gives up (radio not connected / not responding) -- there is no on-the-fly
+  baud re-detection.
 - Up to **4** BLE peers by default (raise `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` for
   more).
 - The USB radio must stay powered; on sudden USB disconnect the firmware reopens

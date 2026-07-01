@@ -191,6 +191,8 @@ Bridge* / *Message Router*):
 | `CONFIG_UART_RADIO_TX_GPIO`     | `17`        | TX → RX AT-радио |
 | `CONFIG_UART_RADIO_RX_GPIO`     | `18`        | RX ← TX AT-радио |
 | `CONFIG_UART_RADIO_BUF_SIZE`    | `512`       | Скретч-буфер Radio UART |
+| `CONFIG_UART_RADIO_STARTUP_DELAY_MS` | `5000` | Задержка перед началом авто-бауда (мс) |
+| `CONFIG_UART_RADIO_PROBE_ATTEMPTS`   | `3`    | Попыток авто-бауда, затем задача сдаётся |
 | `CONFIG_UART_LORA_NUM`          | `2` (UART2) | UART-контроллер для Lora (должен отличаться от Radio) |
 | `CONFIG_UART_LORA_TX_GPIO`      | `21`        | TX → RX Lora |
 | `CONFIG_UART_LORA_RX_GPIO`      | `47`        | RX ← TX Lora |
@@ -274,9 +276,13 @@ void      msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,      
 регистрирует свой sink в роутере и крутит RX-задачу, которая отправляет принятые
 байты в роутер.
 
-- **UART Radio** (`uart_radio_init()`): задача авто-бауда перебирает 9600/115200
-  по рукопожатию `AT`→`OK`; после определения скорости запускается RX-задача. До
-  этого исходящие кадры отбрасываются (`uart_radio_baud()` возвращает 0).
+- **UART Radio** (`uart_radio_init()`): через `CONFIG_UART_RADIO_STARTUP_DELAY_MS`
+  (по умолч. 5 с) после загрузки задача авто-бауда перебирает 9600/115200 по
+  рукопожатию `AT`→`OK`, затем шлёт `AT+SYNCOVER` и ждёт `OK`; только после этого
+  публикуется скорость и запускается RX-задача (бридж становится активен). До
+  этого исходящие в Radio кадры отбрасываются (`b->baud` == 0). После
+  `CONFIG_UART_RADIO_PROBE_ATTEMPTS` неудачных попыток задача останавливается —
+  если рация не ответила за это время, бридж для неё остаётся выключенным.
 - **UART Lora** (`uart_lora_init()`): фикс. скорость из конфига, RX-задача всегда
   активна.
 
@@ -338,17 +344,19 @@ idf.py -p PORT flash monitor
 I (xxx) MSG_ROUTER: Initialized (buffer 8192 bytes)
 I (xxx) USB_CDC: Installing USB Host
 I (xxx) USB_CDC: Installing CDC-ACM driver
-I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), probing baud...
+I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), auto-baud in 5000 ms...
 I (xxx) UART_LORA:  Driver installed (UART2 TX=GPIO21 RX=GPIO47 @9600 bps)
 I (xxx) NORDIC_UART: Started (max 4 connections)
 I (xxx) MSG_ROUTER: Routing task started
 I (xxx) USB_CDC: Opening CDC ACM device 0x1FC9:0x0094...
-I (xxx) UART_RADIO: Baud detected: 115200 bps
-I (xxx) UART_RADIO: RX task started (115200 bps)
 I (xxx) USB_CDC: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
 I (xxx) USB_CDC: Connected CDC ACM device 0x1FC9:0x0094
 I (xxx) NORDIC_UART: Connected handle=0  total=1/4
 I (xxx) NORDIC_UART: Subscribe handle=0 notify=1
+I (xxx) UART_RADIO: Startup delay 5000 ms before probing
+I (xxx) UART_RADIO: AT OK at 115200 bps, sending init
+I (xxx) UART_RADIO: Initialized @ 115200 bps, bridge active
+I (xxx) UART_RADIO: RX task started (115200 bps)
 I (xxx) USB_CDC: radio -> 5 byte(s)
 I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
 ```
@@ -360,9 +368,12 @@ I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
   адресатам, отредактируйте `switch` в
   [`msg_router.c`](components/msg_router/src/msg_router.c) (см.
   [Маршрутизация](#маршрутизация)).
-- **Авто-бауд UART Radio:** пока рукопожатие `AT`→`OK` не прошло успешно, Radio
-  UART только слушает, а исходящие в него кадры отбрасываются. Повторное
-  определение скорости выполняется автоматически при горячем подключении.
+- **Авто-бауд UART Radio:** через `CONFIG_UART_RADIO_STARTUP_DELAY_MS` после
+  загрузки задача шлёт `AT` (определение 9600/115200), затем `AT+SYNCOVER`
+  (инициализация); бридж активируется только после `OK` на обе команды. Пока
+  инициализация не прошла, исходящие в Radio кадры отбрасываются. После
+  `CONFIG_UART_RADIO_PROBE_ATTEMPTS` неудачных попыток задача сдаётся (рация не
+  подключена/не отвечает) — повторного перебора скорости «на лету» нет.
 - По умолчанию до **4** клиентов BLE (поднимите `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`
   для большего числа).
 - USB-рация должна оставаться запитанной; при внезапном USB-разрыве прошивка

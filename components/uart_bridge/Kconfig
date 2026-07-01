@@ -27,6 +27,24 @@ menu "UART Bridge"
             int "RX scratch buffer size (bytes)"
             default 512
             range 128 4096
+
+        config UART_RADIO_STARTUP_DELAY_MS
+            int "Delay before first probe (ms)"
+            default 5000
+            range 0 60000
+            help
+                How long to wait after boot before the auto-baud task starts
+                probing the AT radio link (lets USB/BLE settle first).
+
+        config UART_RADIO_PROBE_ATTEMPTS
+            int "Max probe attempts"
+            default 3
+            range 1 20
+            help
+                Number of full baud-probing rounds (each round tries 9600 then
+                115200 with an "AT"->"OK" + "AT+SYNCOVER"->"OK" exchange). After
+                this many failed rounds the radio bridge stays disabled instead
+                of retrying forever.
     endmenu
 
     menu "UART Lora (fixed baud)"
