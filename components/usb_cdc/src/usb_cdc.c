@@ -80,7 +80,7 @@ static bool handle_rx(const uint8_t *data, size_t data_len, void *arg)
 {
     (void)arg;
     msg_submit(MSG_IF_USB_CDC, data, data_len);
-    ESP_LOGI(TAG, "radio -> %u byte(s)", data_len);
+    ESP_LOGD(TAG, "radio -> %u byte(s)", data_len);
     return true;
 }
 

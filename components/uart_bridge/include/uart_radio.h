@@ -4,9 +4,12 @@
  * UART Radio interface.
  *
  * A serial AT-command device whose baud rate is unknown at boot. The driver
- * probes 9600 and 115200 by sending "AT" and listening for an "OK" reply, and
- * keeps retrying (so hot-plug works). Once a valid baud is found the RX task
- * is started and the interface registers itself as a router sink.
+ * probes 9600 and 115200 by sending "AT" and listening for an "OK" reply,
+ * retrying up to CONFIG_UART_RADIO_PROBE_ATTEMPTS rounds (so a radio connected
+ * a few seconds after boot is still detected). Once a valid baud is found the
+ * RX task is started and the interface registers itself as a router sink.
+ * If no radio answers within the configured attempts, probing stops and the
+ * bridge stays disabled until reboot.
  *
  * Configuration: UART peripheral + TX/RX GPIOs are set in menuconfig
  * (Component config -> UART Bridge).

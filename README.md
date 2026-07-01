@@ -149,8 +149,10 @@ Connect the USB signals from the ESP32-S3 OTG port to the radio:
 | GND                                      | GND |
 
 The driver sends `AT` and listens for an `OK` reply, trying 9600 first and then
-115200. It keeps retrying, so the device may be connected after boot
-(hot-plug). Cross connect TX↔RX and share a common ground.
+115200, for up to `CONFIG_UART_RADIO_PROBE_ATTEMPTS` rounds — so a radio
+connected a few seconds after boot is still detected. After that the bridge
+gives up and stays disabled (reboot to retry). Cross connect TX↔RX and share a
+common ground.
 
 ### UART Lora wiring
 
