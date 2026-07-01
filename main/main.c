@@ -2,13 +2,19 @@
  * SPDX-FileCopyrightText: 2015-2023 Espressif Systems (Shanghai) CO LTD
  * SPDX-License-Identifier: CC0-1.0
  *
- * Tyt MD-9600 BLE-UART Bridge (multi-connection).
+ * Tyt MD-9600 multi-interface bridge.
  *
- * Bridges a USB CDC-ACM device (the radio, 0x1FC9:0x0094) and a BLE Nordic
- * UART Service supporting up to CONFIG_BT_NIMBLE_MAX_CONNECTIONS peers.
+ * Bridges four transparent byte channels through a central message router
+ * (components/msg_router), with per-source routing policy implemented as a
+ * switch in msg_router.c:
  *
- *   USB  -> BLE : radio replies are broadcast to every subscribed peer.
- *   BLE  -> USB : data written by any peer is forwarded to the radio.
+ *   - USB CDC-ACM   : the radio (Tyt MD-9600, 0x1FC9:0x0094)
+ *   - BLE Nordic UART Service (multi-connection, up to CONFIG_BT_NIMBLE_MAX_CONNECTIONS)
+ *   - UART Radio    : AT device, auto-baud 9600/115200
+ *   - UART Lora     : fixed baud (configurable)
+ *
+ * By default every frame is forwarded to ALL other interfaces. Edit
+ * route_message() in msg_router.c to set per-source forwarding rules.
  */
 
 #include <stdio.h>
@@ -22,7 +28,11 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/ringbuf.h"
+
 #include "nordic_uart_multi.h"
+#include "msg_router.h"
+#include "uart_radio.h"
+#include "uart_lora.h"
 
 #include "usb/usb_host.h"
 #include "usb/cdc_acm_host.h"
@@ -36,22 +46,38 @@ static const char *TAG = "DMR-RADIO";
 static SemaphoreHandle_t device_disconnected_sem;
 cdc_acm_dev_hdl_t cdc_dev = NULL;
 
+/* ----------------------------------------------------------- router sinks */
+
+/** Deliver a frame to the USB CDC device (the radio). Drops if not open. */
+static void usb_cdc_sink(const uint8_t *data, size_t len)
+{
+    if (cdc_dev == NULL) {
+        return;
+    }
+    esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, data, len,
+                                                  USB_TX_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW("ROUTER->USB", "USB CDC tx failed: %s", esp_err_to_name(err));
+    }
+}
+
+/** Deliver a frame to all subscribed BLE peers. */
+static void ble_sink(const uint8_t *data, size_t len)
+{
+    esp_err_t err = nordic_uart_send(data, len);
+    if (err != ESP_OK) {
+        ESP_LOGW("ROUTER->BLE", "BLE send failed: %s", esp_err_to_name(err));
+    }
+}
+
 /**
- * @brief Data received from the USB CDC device (radio -> BLE).
- *
- * Broadcast the radio's reply to every connected/subscribed BLE peer.
+ * @brief Data received from the USB CDC device (radio -> router).
  */
 static bool handle_rx(const uint8_t *data, size_t data_len, void *arg)
 {
     (void)arg;
-
-    esp_err_t err = nordic_uart_send(data, data_len);
-    if (err != ESP_OK) {
-        ESP_LOGW("UART->BLE", "Failed to send %u bytes: %s",
-                 data_len, esp_err_to_name(err));
-    }
-    ESP_LOGI("UART->BLE", "radio -> %u byte(s) to %u peer(s)",
-             data_len, nordic_uart_subscribed_count());
+    msg_submit(MSG_IF_USB_CDC, data, data_len);
+    ESP_LOGI("USB->ROUTER", "radio -> %u byte(s)", data_len);
     return true;
 }
 
@@ -99,12 +125,12 @@ static void usb_lib_task(void *arg)
 }
 
 /**
- * @brief BLE -> USB bridge task.
+ * @brief BLE -> router task.
  *
  * Drains the Nordic UART RX ring buffer (data written by any BLE peer) and
- * forwards each frame to the USB CDC device (the radio).
+ * submits each frame to the message router tagged with MSG_IF_BLE.
  */
-void ble_to_usb_task(void *parameter)
+void ble_to_router_task(void *parameter)
 {
     (void)parameter;
     for (;;) {
@@ -122,17 +148,9 @@ void ble_to_usb_task(void *parameter)
             continue;
         }
 
-        ESP_LOGI("BLE->UART", "peer=%u -> radio %u byte(s)",
+        ESP_LOGI("BLE->ROUTER", "peer=%u -> %u byte(s)",
                  item->conn_handle, item->len);
-
-        if (cdc_dev != NULL) {
-            esp_err_t err = cdc_acm_host_data_tx_blocking(
-                cdc_dev, item->data, item->len, USB_TX_TIMEOUT_MS);
-            if (err != ESP_OK) {
-                ESP_LOGW("BLE->UART", "Failed send to USB UART: %s",
-                         esp_err_to_name(err));
-            }
-        }
+        msg_submit(MSG_IF_BLE, item->data, item->len);
 
         vRingbufferReturnItem(nordic_uart_rx_buf_handle, (void *)item);
     }
@@ -148,7 +166,24 @@ void app_main(void)
     device_disconnected_sem = xSemaphoreCreateBinary();
     assert(device_disconnected_sem);
 
-    /* Install USB Host driver. Should only be called once in entire application */
+    /* --- Message router: create queue, register sinks, start task -------- */
+    ESP_ERROR_CHECK(msg_router_init());
+    msg_router_register_sink(MSG_IF_USB_CDC, usb_cdc_sink);
+    msg_router_register_sink(MSG_IF_BLE,     ble_sink);
+
+    /* --- UART interfaces (self-register their sinks) --------------------- */
+    ESP_ERROR_CHECK(uart_radio_init());
+    ESP_ERROR_CHECK(uart_lora_init());
+
+    ESP_ERROR_CHECK(msg_router_start());
+
+    /* --- BLE Nordic UART peripheral -------------------------------------- */
+    nordic_uart_start("DMR-RADIO");
+    BaseType_t task_created = xTaskCreate(ble_to_router_task, "ble2rt", 5000,
+                                          NULL, 1, NULL);
+    assert(task_created == pdTRUE);
+
+    /* --- USB Host + CDC-ACM ---------------------------------------------- */
     ESP_LOGI(TAG, "Installing USB Host");
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
@@ -156,10 +191,9 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
-    /* Create a task that will handle USB library events */
-    BaseType_t task_created = xTaskCreate(usb_lib_task, "usb_lib", 4096,
-                                          xTaskGetCurrentTaskHandle(),
-                                          USB_HOST_PRIORITY, NULL);
+    task_created = xTaskCreate(usb_lib_task, "usb_lib", 4096,
+                                xTaskGetCurrentTaskHandle(),
+                                USB_HOST_PRIORITY, NULL);
     assert(task_created == pdTRUE);
 
     ESP_LOGI(TAG, "Installing CDC-ACM driver");
@@ -173,11 +207,6 @@ void app_main(void)
         .event_cb = handle_event,
         .data_cb = handle_rx,
     };
-
-    /* Start the multi-connection BLE Nordic UART peripheral */
-    nordic_uart_start("DMR-RADIO");
-    task_created = xTaskCreate(ble_to_usb_task, "ble2usb", 5000, NULL, 1, NULL);
-    assert(task_created == pdTRUE);
 
     while (true) {
         ESP_LOGI(TAG, "Opening CDC ACM device 0x%04X:0x%04X...",

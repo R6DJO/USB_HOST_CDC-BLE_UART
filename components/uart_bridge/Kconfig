@@ -1,0 +1,68 @@
+menu "UART Bridge"
+
+    menu "UART Radio (AT, auto-baud 9600/115200)"
+        config UART_RADIO_NUM
+            int "UART peripheral number"
+            default 1
+            range 0 2
+            help
+                Which UART controller to use for the Radio AT link.
+                UART0 is usually the log console, so prefer UART1 or UART2.
+
+        config UART_RADIO_TX_GPIO
+            int "TX GPIO"
+            default 17
+            range 0 48
+            help
+                GPIO connected to the Radio's RX line.
+
+        config UART_RADIO_RX_GPIO
+            int "RX GPIO"
+            default 18
+            range 0 48
+            help
+                GPIO connected to the Radio's TX line.
+
+        config UART_RADIO_BUF_SIZE
+            int "RX scratch buffer size (bytes)"
+            default 512
+            range 128 4096
+    endmenu
+
+    menu "UART Lora (fixed baud)"
+        config UART_LORA_NUM
+            int "UART peripheral number"
+            default 2
+            range 0 2
+            help
+                Which UART controller to use for the Lora link.
+                Must differ from the Radio UART peripheral.
+
+        config UART_LORA_TX_GPIO
+            int "TX GPIO"
+            default 21
+            range 0 48
+            help
+                GPIO connected to the Lora module's RX line.
+
+        config UART_LORA_RX_GPIO
+            int "RX GPIO"
+            default 47
+            range 0 48
+            help
+                GPIO connected to the Lora module's TX line.
+
+        config UART_LORA_BAUDRATE
+            int "Baud rate"
+            default 9600
+            range 1200 5000000
+            help
+                Fixed baud rate for the Lora link (default 9600).
+
+        config UART_LORA_BUF_SIZE
+            int "RX scratch buffer size (bytes)"
+            default 512
+            range 128 4096
+    endmenu
+
+endmenu

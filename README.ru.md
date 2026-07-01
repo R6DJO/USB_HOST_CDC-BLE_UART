@@ -1,17 +1,25 @@
-# Tyt MD-9600 BLE-UART мост (мульти-соединение)
+# Tyt MD-9600 Многоинтерфейсный мост (USB CDC / BLE / UART)
 
 [English](README.md) | **Русский**
 
 | Целевая платформа | ESP32-S3 |
 | ----------------- | -------- |
 
-Прошивка для **ESP32-S3**, выполняющая роль моста между USB CDC-ACM устройством
-(рации **Tyt MD-9600**, DMR) и каналом **Bluetooth Low Energy**, через
-[Nordic UART Service (NUS)](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/nrf/libraries/bluetooth_services/services/nus.html).
+Прошивка для **ESP32-S3**, объединяющая несколько прозрачных последовательных
+каналов через центральный маршрутизатор (`msg_router`):
 
-Прошивка позволяет одному или нескольким (до **4**) BLE-клиентам — телефону, ПК,
-планшету — общаться с радиостанцией по беспроводному последовательному каналу
-вместо USB-кабеля.
+- **USB CDC-ACM** устройство — радиостанция **Tyt MD-9600** (`1FC9:0094`);
+- канал **Bluetooth Low Energy** через
+  [Nordic UART Service (NUS)](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/nrf/libraries/bluetooth_services/services/nus.html),
+  до **4** одновременных клиентов;
+- **UART Radio** — AT-устройство, скорость которого определяется
+  **автоматически** (9600 / 115200);
+- **UART Lora** — последовательный канал с фиксированной скоростью (по
+  умолчанию 9600).
+
+По умолчанию каждый кадр, принятый на одном интерфейсе, пересылается **во все
+остальные**; индивидуальные правила маршрутизации по источнику задаются простым
+`switch` внутри маршрутизатора (см. [Маршрутизация](#маршрутизация)).
 
 > Целевая платформа — именно **ESP32-S3**: нужны одновременно USB-OTG в режиме
 > host (для связи с рацией) **и** BLE-контроллер (у ESP32-S2 BLE отсутствует).
@@ -19,21 +27,59 @@
 ## Как это работает
 
 ```
-   ┌─────────────┐    USB CDC-ACM     ┌──────────────────┐    BLE NUS      ┌──────────┐
-   │  Tyt MD-9600│  ◄──────────────►  │   ESP32-S3       │  ◄──────────►  │  Клиент 1│
-   │  (рация)    │   0x1FC9:0x0094    │  (эта прошивка)  │                │  Клиент 2│
-   │             │    115200 8N1      │                  │                │  ... до  │
-   └─────────────┘                    └──────────────────┘                │   4      │
-       VID:PID = 1FC9:0094                                                 └──────────┘
+                 ┌──────────────────── ESP32-S3 ────────────────────┐
+   USB CDC-ACM ─►│                  msg_router                      │◄─ BLE NUS ─► клиенты (≤4)
+   Tyt MD-9600   │              (задача-коммутатор)                 │   Nordic UART Service
+   115200 8N1  ◄─┤                                                 │
+                 │   по умолчанию: источник → ВСЕ остальные         │
+   UART Radio ─►│   (переопределяется per-source `switch` в        │
+   AT-устройство │    components/msg_router/src/msg_router.c)       │
+   авто-бауд   ◄─┤   пробует 9600, затем 115200 по ответу на "AT"   │
+                 │                                                 │
+   UART Lora  ─►│                                                 │
+   модуль        │                                                 │
+   9600        ◄─┤   скорость из menuconfig (по умолчанию 9600)     │
+                 └─────────────────────────────────────────────────┘
 ```
+
+Четыре симметричных интерфейса, каждый является одновременно источником **и**
+приёмником:
+
+| Интерфейс | id в роутере | Физический канал |
+|-----------|--------------|------------------|
+| USB CDC   | `MSG_IF_USB_CDC`    | Tyt MD-9600 по USB CDC-ACM `1FC9:0094` @ 115200 8N1 |
+| BLE NUS   | `MSG_IF_BLE`        | Nordic UART Service, до 4 клиентов |
+| UART Radio| `MSG_IF_UART_RADIO` | UART-контроллер (по умолч. UART1), AT-устройство, авто-бауд 9600/115200 |
+| UART Lora | `MSG_IF_UART_LORA`  | UART-контроллер (по умолч. UART2), фиксированная скорость (по умолч. 9600) |
 
 | Направление | Поведение |
 |-------------|-----------|
-| **Рация → BLE** (`UART->BLE`) | Данные, принятые от рации по USB, **рассылаются всем** подписанным BLE-клиентам (broadcast). |
-| **BLE → Рация** (`BLE->UART`) | Данные, записанные **любым** клиентом, пересылаются в рацию по USB. Каждый принятый кадр помечается источником `conn_handle`. |
+| Любой интерфейс → все остальные | Кадр, принятый на любом интерфейсе, по умолчанию пересылается **во все остальные** (hub / broadcast). Каждый интерфейс помечает свои кадры своим id в роутере. |
 
 Мост **бинарно-прозрачный** (без построчной буферизации и трансляции CR-LF),
 поэтому подходит как для CPS-протокола рации, так и для обычных AT-команд.
+
+### Маршрутизация
+
+Логика маршрутизации сосредоточена в одном месте: `switch` по источнику в
+функции `route_message()`
+([`components/msg_router/src/msg_router.c`](components/msg_router/src/msg_router.c)).
+По умолчанию каждый `case` пересылает кадр во все остальные интерфейсы. Чтобы
+ограничить источник конкретным набором адресатов, отредактируйте нужный `case` и
+отправляйте явно через `msg_router_send_to()`:
+
+```c
+static void route_message(msg_iface_t src, const uint8_t *data, size_t len)
+{
+    switch (src) {
+    case MSG_IF_UART_LORA:
+        // Lora -> только в BLE
+        msg_router_send_to(MSG_IF_BLE, data, len);
+        break;
+    /* ...остальные case'ы сохраняют поведение hub по умолчанию... */
+    }
+}
+```
 
 ### BLE-сервис
 
@@ -53,6 +99,10 @@
   USB host).
 - 1 × радиостанция **Tyt MD-9600** (представляется как USB CDC-ACM `1FC9:0094`),
   подключённая кабелем или через USB-A-брейкboard.
+- (опционально) AT-модуль радиосвязи по UART.
+- (опционально) **Lora**-модуль по UART.
+
+### Подключение USB CDC (рация)
 
 Соедините USB-линии от порта USB-OTG платы ESP32-S3 с рацией:
 
@@ -65,6 +115,30 @@
 
 > Обеспечьте достаточное питание. Рация должна быть запитана и включена (или
 > находиться в режиме программирования), чтобы её CDC-интерфейс обнаружился.
+
+### Подключение UART Radio (AT, авто-бауд)
+
+| Вывод ESP32-S3 (по умолчанию) | AT-радиомодуль |
+|-------------------------------|----------------|
+| `CONFIG_UART_RADIO_TX_GPIO` (GPIO17) →  | RX  |
+| `CONFIG_UART_RADIO_RX_GPIO` (GPIO18) ←  | TX  |
+| GND                                      | GND |
+
+Драйвер отправляет `AT` и ждёт ответ `OK`, перебирая сначала 9600, затем 115200.
+Поиск повторяется, поэтому устройство можно подключить и после старта
+(горячее подключение). Скрестите TX↔RX и объедините общую землю.
+
+### Подключение UART Lora
+
+| Вывод ESP32-S3 (по умолчанию) | Модуль Lora |
+|-------------------------------|-------------|
+| `CONFIG_UART_LORA_TX_GPIO` (GPIO21) →  | RX  |
+| `CONFIG_UART_LORA_RX_GPIO` (GPIO47) ←  | TX  |
+| GND                                      | GND |
+
+> Все GPIO и номера UART-контроллеров настраиваются под вашу плату в `menuconfig`
+> (см. [Конфигурация](#конфигурация)). UART-контроллеры должны различаться (по
+> умолчанию: UART1 для Radio, UART2 для Lora).
 
 ## Конфигурация
 
@@ -79,19 +153,80 @@
 | `CONFIG_BT_NIMBLE_GATT_MAX_PROCS` | `8` | Одновременные GATT-процедуры |
 | `CONFIG_NORDIC_UART_RX_BUFFER_SIZE` | `4096` | Размер кольцевого буфера BLE → байт |
 
+Пины/скорости UART-интерфейсов и буфер роутера (*Component config → UART
+Bridge* / *Message Router*):
+
+| Параметр | По умолчанию | Назначение |
+|----------|--------------|------------|
+| `CONFIG_UART_RADIO_NUM`         | `1` (UART1) | UART-контроллер для AT-радио |
+| `CONFIG_UART_RADIO_TX_GPIO`     | `17`        | TX → RX AT-радио |
+| `CONFIG_UART_RADIO_RX_GPIO`     | `18`        | RX ← TX AT-радио |
+| `CONFIG_UART_RADIO_BUF_SIZE`    | `512`       | Скретч-буфер Radio UART |
+| `CONFIG_UART_LORA_NUM`          | `2` (UART2) | UART-контроллер для Lora (должен отличаться от Radio) |
+| `CONFIG_UART_LORA_TX_GPIO`      | `21`        | TX → RX Lora |
+| `CONFIG_UART_LORA_RX_GPIO`      | `47`        | RX ← TX Lora |
+| `CONFIG_UART_LORA_BAUDRATE`     | `9600`      | Фиксированная скорость Lora |
+| `CONFIG_UART_LORA_BUF_SIZE`     | `512`       | Скретч-буфер Lora UART |
+| `CONFIG_MSG_ROUTER_BUF_SIZE`    | `8192`      | Центральный буфер маршрутизации (байт) |
+
 Параметры USB CDC задаются в [`main/main.c`](main/main.c): **115200 8N1**, DTR
 активен, RTS неактивен. При необходимости поменяйте `MD9600_USB_DEVICE_VID` /
 `PID` там же, если рация сообщает другие ID.
 
-Чтобы изменить допустимое число клиентов, отредактируйте `sdkconfig.defaults`
-(или выполните `idf.py menuconfig` → *Component config* → *Bluetooth* →
-*NimBLE options* → *Maximum number of concurrent connections*) и пересоберите.
+Чтобы изменить любое из этих значений, отредактируйте `sdkconfig.defaults` (или
+выполните `idf.py menuconfig` → *Component config* → *Bluetooth* / *UART
+Bridge* / *Message Router*) и пересоберите.
 
-## Компонент `nordic_uart_multi`
+## Компоненты
 
-BLE-часть реализована локальным компонентом:
-[`components/nordic_uart_multi`](components/nordic_uart_multi). Он реализует
-периферию NUS с мульти-соединением и предоставляет небольшой C-API:
+Прошивка разбита на три локальных компонента в каталоге
+[`components/`](components):
+
+| Компонент | Роль |
+|-----------|------|
+| [`nordic_uart_multi`](components/nordic_uart_multi) | BLE-периферия Nordic UART Service с мульти-соединением |
+| [`msg_router`](components/msg_router)              | Центральная очередь маршрутизации + задача `msg_routing` + per-source `switch` |
+| [`uart_bridge`](components/uart_bridge)            | UART Radio (авто-бауд) + UART Lora (фикс. скорость) |
+
+### `msg_router`
+
+Единый кольцевой буфер FreeRTOS хранит кадры с меткой источника; задача
+`msg_routing` выбирает их и отправляет в «приёмники» (sinks), зарегистрированные
+через `msg_router_register_sink()`. Производители помещают кадры через
+`msg_submit()`. Политика маршрутизации — это `switch`, описанный в разделе
+[Маршрутизация](#маршрутизация).
+
+```c
+#include "msg_router.h"
+
+typedef enum {
+    MSG_IF_USB_CDC, MSG_IF_BLE, MSG_IF_UART_RADIO, MSG_IF_UART_LORA, MSG_IF_COUNT,
+} msg_iface_t;
+
+typedef void (*msg_sink_fn_t)(const uint8_t *data, size_t len);
+
+esp_err_t msg_router_init(void);
+esp_err_t msg_router_register_sink(msg_iface_t dest, msg_sink_fn_t fn); /* подключить интерфейс */
+esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len);  /* точка входа производителей */
+esp_err_t msg_router_start(void);                                        /* запустить задачу */
+void      msg_router_send_to(msg_iface_t dest, const uint8_t *data, size_t len); /* явная пересылка */
+```
+
+### `uart_bridge`
+
+Обёртка над двумя UART-каналами. Каждый устанавливает UART-драйвер,
+регистрирует свой sink в роутере и крутит RX-задачу, которая отправляет принятые
+байты в роутер.
+
+- **UART Radio** (`uart_radio_init()`): задача авто-бауда перебирает 9600/115200
+  по рукопожатию `AT`→`OK`; после определения скорости запускается RX-задача. До
+  этого исходящие кадры отбрасываются (`uart_radio_baud()` возвращает 0).
+- **UART Lora** (`uart_lora_init()`): фикс. скорость из конфига, RX-задача всегда
+  активна.
+
+### `nordic_uart_multi`
+
+BLE-часть: периферия NUS с мульти-соединением и небольшим C-API.
 
 ```c
 #include "nordic_uart_multi.h"
@@ -100,7 +235,7 @@ BLE-часть реализована локальным компонентом:
 esp_err_t nordic_uart_start(const char *device_name);   /* NULL -> "Nordic UART" */
 esp_err_t nordic_uart_stop(void);
 
-/* Отправка (рация -> BLE). Бинарно-безопасно, дробится по ATT MTU клиента. */
+/* Отправка (роутер -> BLE). Бинарно-безопасно, дробится по ATT MTU клиента. */
 esp_err_t nordic_uart_send        (const uint8_t *data, size_t len);            /* всем клиентам       */
 esp_err_t nordic_uart_send_to     (uint16_t conn_handle, const uint8_t *d, size_t len); /* одному     */
 esp_err_t nordic_uart_send_except (uint16_t conn_handle, const uint8_t *d, size_t len); /* всем, кроме 1 */
@@ -114,7 +249,7 @@ esp_err_t nordic_uart_send_str_except (uint16_t conn_handle, const char *str);
 uint8_t   nordic_uart_client_count(void);       /* подключённые клиенты      */
 uint8_t   nordic_uart_subscribed_count(void);   /* клиенты с включенным TX notify */
 
-/* Входящие данные (BLE -> рация). Один кадр на запись клиента, с меткой источника. */
+/* Входящие данные (BLE -> роутер). Один кадр на запись клиента, с меткой источника. */
 extern RingbufHandle_t nordic_uart_rx_buf_handle;
 
 typedef struct {
@@ -124,16 +259,7 @@ typedef struct {
 } nordic_uart_rx_item_t;
 ```
 
-Чтение из RX-буфера в вашей задаче:
-
-```c
-size_t sz = 0;
-const nordic_uart_rx_item_t *it = xRingbufferReceive(nordic_uart_rx_buf_handle, &sz, portMAX_DELAY);
-if (it) {
-    /* переслать it->data (it->len байт) в рацию; it->conn_handle — источник */
-    vRingbufferReturnItem(nordic_uart_rx_buf_handle, (void *)it);
-}
-```
+`main.c` выбирает данные из этого буфера и вызывает `msg_submit(MSG_IF_BLE, ...)`.
 
 ## Сборка и прошивка
 
@@ -149,29 +275,39 @@ idf.py -p PORT flash monitor
 
 ## Ожидаемый вывод
 
-После прошивки подключите рацию и сопрягите BLE-клиент с `DMR-RADIO`. Типичный
-лог:
+После прошивки подключите рацию / UART-устройства и сопрягите BLE-клиент с
+`DMR-RADIO`. Типичный лог:
 
 ```
+I (xxx) MSG_ROUTER: Initialized (buffer 8192 bytes)
+I (xxx) UART_RADIO: Driver installed (UART1 TX=GPIO17 RX=GPIO18), probing baud...
+I (xxx) UART_LORA:  Driver installed (UART2 TX=GPIO21 RX=GPIO47 @9600 bps)
+I (xxx) MSG_ROUTER: Routing task started
+I (xxx) NORDIC_UART: Started (max 4 connections)
 I (xxx) DMR-RADIO: Installing USB Host
 I (xxx) DMR-RADIO: Installing CDC-ACM driver
-I (xxx) NORDIC_UART: Started (max 4 connections)
+I (xxx) UART_RADIO: Baud detected: 115200 bps
+I (xxx) UART_RADIO: RX task started (115200 bps)
 I (xxx) DMR-RADIO: Opening CDC ACM device 0x1FC9:0x0094...
 I (xxx) DMR-RADIO: Line Get: Rate: 115200, Stop bits: 1, Parity: 0, Databits: 8
 I (xxx) DMR-RADIO: Connected CDC ACM device 0x1FC9:0x0094 (0 BLE peer(s))...
 I (xxx) NORDIC_UART: Connected handle=0  total=1/4
 I (xxx) NORDIC_UART: Subscribe handle=0 notify=1
-I (xxx) UART->BLE: radio -> 5 byte(s) to 1 peer(s)
-I (xxx) BLE->UART: peer=0 -> radio 9 byte(s)
+I (xxx) USB->ROUTER:  radio -> 5 byte(s)
+I (xxx) BLE->ROUTER:  peer=0 -> 9 byte(s)
 ```
 
 ## Замечания / ограничения
 
-- **Broadcast-модель:** рация — единый приёмник по USB, поэтому ответы рации
-  рассылаются всем подписанным клиентам, а ввод принимается от любого из них.
-  При необходимости точечной или «всем, кроме отправителя» доставки используйте
-  `nordic_uart_send_to()` / `nordic_uart_send_except()` в коде приложения.
-- По умолчанию до **4** клиентов (лимит контроллера/стека ESP32-S3 выше;
-  поднимите `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`, если нужно больше).
-- Рация должна оставаться запитанной; при внезапном USB-разрыве прошивка
+- **Модель hub:** по умолчанию каждый принятый кадр пересылается во все
+  остальные интерфейсы. Чтобы источник доставлял данные только конкретным
+  адресатам, отредактируйте `switch` в
+  [`msg_router.c`](components/msg_router/src/msg_router.c) (см.
+  [Маршрутизация](#маршрутизация)).
+- **Авто-бауд UART Radio:** пока рукопожатие `AT`→`OK` не прошло успешно, Radio
+  UART только слушает, а исходящие в него кадры отбрасываются. Повторное
+  определение скорости выполняется автоматически при горячем подключении.
+- По умолчанию до **4** клиентов BLE (поднимите `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`
+  для большего числа).
+- USB-рация должна оставаться запитанной; при внезапном USB-разрыве прошивка
   автоматически переподключается к CDC-устройству.

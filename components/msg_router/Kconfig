@@ -1,0 +1,11 @@
+menu "Message Router"
+
+    config MSG_ROUTER_BUF_SIZE
+        int "Routing ring buffer size (bytes)"
+        default 8192
+        range 512 65536
+        help
+            Size of the FreeRTOS ring buffer that queues frames between all
+            interfaces. Holds a small header plus the payload per frame.
+
+endmenu

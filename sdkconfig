@@ -2610,10 +2610,40 @@ CONFIG_WIFI_PROV_STA_ALL_CHANNEL_SCAN=y
 # end of Wi-Fi Provisioning Manager
 
 #
+# Message Router
+#
+CONFIG_MSG_ROUTER_BUF_SIZE=8192
+# end of Message Router
+
+#
 # Nordic UART (multi-connection) Configuration
 #
 CONFIG_NORDIC_UART_RX_BUFFER_SIZE=4096
 # end of Nordic UART (multi-connection) Configuration
+
+#
+# UART Bridge
+#
+
+#
+# UART Radio (AT, auto-baud 9600/115200)
+#
+CONFIG_UART_RADIO_NUM=1
+CONFIG_UART_RADIO_TX_GPIO=17
+CONFIG_UART_RADIO_RX_GPIO=18
+CONFIG_UART_RADIO_BUF_SIZE=512
+# end of UART Radio (AT, auto-baud 9600/115200)
+
+#
+# UART Lora (fixed baud)
+#
+CONFIG_UART_LORA_NUM=2
+CONFIG_UART_LORA_TX_GPIO=21
+CONFIG_UART_LORA_RX_GPIO=47
+CONFIG_UART_LORA_BAUDRATE=9600
+CONFIG_UART_LORA_BUF_SIZE=512
+# end of UART Lora (fixed baud)
+# end of UART Bridge
 # end of Component config
 
 # CONFIG_IDF_EXPERIMENTAL_FEATURES is not set

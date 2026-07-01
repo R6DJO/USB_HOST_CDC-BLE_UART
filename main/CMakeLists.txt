@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES nordic_uart_multi)
+                    REQUIRES nordic_uart_multi msg_router uart_bridge)
