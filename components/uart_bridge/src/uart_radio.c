@@ -43,8 +43,11 @@ static void uart_radio_rx_task(void *arg);
 
 /* --------------------------------------------------------------- sink (TX) */
 
-static void uart_radio_sink(const uint8_t *data, size_t len)
+static void uart_radio_sink(const msg_origin_t *origin, const uint8_t *data, size_t len)
 {
+    if (origin->iface == MSG_IF_UART_RADIO) {
+        return; /* don't echo back to the radio UART */
+    }
     if (s_baud == 0) {
         return; /* baud not detected yet: nowhere to send */
     }

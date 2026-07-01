@@ -48,9 +48,13 @@ cdc_acm_dev_hdl_t cdc_dev = NULL;
 
 /* ----------------------------------------------------------- router sinks */
 
-/** Deliver a frame to the USB CDC device (the radio). Drops if not open. */
-static void usb_cdc_sink(const uint8_t *data, size_t len)
+/** Deliver a frame to the USB CDC device (the radio). Drops if not open, and
+ * never echoes a frame back to the radio that came from the radio. */
+static void usb_cdc_sink(const msg_origin_t *origin, const uint8_t *data, size_t len)
 {
+    if (origin->iface == MSG_IF_USB_CDC) {
+        return; /* don't loop back to the radio */
+    }
     if (cdc_dev == NULL) {
         return;
     }
@@ -61,10 +65,18 @@ static void usb_cdc_sink(const uint8_t *data, size_t len)
     }
 }
 
-/** Deliver a frame to all subscribed BLE peers. */
-static void ble_sink(const uint8_t *data, size_t len)
+/** Deliver a frame to BLE peers.
+ *  - If the frame came from a BLE peer, send to every OTHER peer (the sender
+ *    is excluded via nordic_uart_send_except) — i.e. no send-back to sender.
+ *  - Otherwise broadcast to all peers (e.g. a radio reply). */
+static void ble_sink(const msg_origin_t *origin, const uint8_t *data, size_t len)
 {
-    esp_err_t err = nordic_uart_send(data, len);
+    esp_err_t err;
+    if (origin->iface == MSG_IF_BLE && origin->peer != MSG_PEER_NONE) {
+        err = nordic_uart_send_except(origin->peer, data, len);
+    } else {
+        err = nordic_uart_send(data, len);
+    }
     if (err != ESP_OK) {
         ESP_LOGW("ROUTER->BLE", "BLE send failed: %s", esp_err_to_name(err));
     }
@@ -150,7 +162,10 @@ void ble_to_router_task(void *parameter)
 
         ESP_LOGI("BLE->ROUTER", "peer=%u -> %u byte(s)",
                  item->conn_handle, item->len);
-        msg_submit(MSG_IF_BLE, item->data, item->len);
+        /* Tag the frame with the sender's conn_handle so the BLE sink can
+         * exclude it (no send-back to the sender). */
+        msg_origin_t origin = { .iface = MSG_IF_BLE, .peer = item->conn_handle };
+        msg_submit_from(&origin, item->data, item->len);
 
         vRingbufferReturnItem(nordic_uart_rx_buf_handle, (void *)item);
     }

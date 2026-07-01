@@ -51,7 +51,7 @@ Four symmetric interfaces, each a source **and** a destination:
 
 | Direction | Behaviour |
 |-----------|-----------|
-| Any interface → all others | A frame received on any interface is, by default, forwarded to **every other** interface (hub / broadcast). Each interface tags its frames with its router id. |
+| Any interface → all others | A frame received on any interface is, by default, delivered to **every** sink. Each sink skips its own originator: single-port interfaces (USB, UART Radio, UART Lora) don't echo back to the same wire; **BLE forwards to every peer *except* the sender** (the sender's `conn_handle` is carried as the frame origin and passed to `nordic_uart_send_except()`). |
 
 The bridge is **binary-transparent** (no line buffering / CR-LF translation), so
 it is suitable for the radio's CPS protocol as well as plain AT commands.
@@ -60,22 +60,49 @@ it is suitable for the radio's CPS protocol as well as plain AT commands.
 
 Routing lives in a single place: the `switch` over the source id in
 `route_message()` ([`components/msg_router/src/msg_router.c`](components/msg_router/src/msg_router.c)).
-The default body of every case forwards to all other interfaces. To restrict a
-source to a specific set of destinations, edit the matching case and forward
-explicitly with `msg_router_send_to()`:
+The default body of every case delivers the frame to all sinks, and each sink
+self-excludes its originator (so the BLE sender never gets its own frame back —
+see [No send-back to the BLE sender](#no-send-back-to-the-ble-sender)). To
+restrict a source to a specific set of destinations, edit the matching case and
+forward explicitly with `msg_router_send_to()`:
 
 ```c
-static void route_message(msg_iface_t src, const uint8_t *data, size_t len)
+static void route_message(const msg_origin_t *origin,
+                          const uint8_t *data, size_t len)
 {
-    switch (src) {
+    switch (origin->iface) {
     case MSG_IF_UART_LORA:
         // Lora -> BLE only
-        msg_router_send_to(MSG_IF_BLE, data, len);
+        msg_router_send_to(MSG_IF_BLE, origin, data, len);
         break;
     /* ...other cases keep the default hub behaviour... */
     }
 }
 ```
+
+#### No send-back to the BLE sender
+
+Because BLE is multi-peer, a BLE-originated frame carries the sender's
+`conn_handle` as its origin (`msg_origin_t.peer`). `main.c` submits it with
+`msg_submit_from()`:
+
+```c
+msg_origin_t origin = { .iface = MSG_IF_BLE, .peer = item->conn_handle };
+msg_submit_from(&origin, item->data, item->len);
+```
+
+and the BLE sink excludes that one peer:
+
+```c
+if (origin->iface == MSG_IF_BLE && origin->peer != MSG_PEER_NONE)
+    nordic_uart_send_except(origin->peer, data, len);  // everyone except sender
+else
+    nordic_uart_send(data, len);                       // broadcast (e.g. radio reply)
+```
+
+So peer A's input reaches the radio, the UARTs, **and peers B/C/D — but not A**.
+To fully isolate BLE clients from each other (no peer fan-out), drop the BLE
+sink from the `MSG_IF_BLE` case (see the comment in `msg_router.c`).
 
 ### BLE service
 
@@ -195,17 +222,26 @@ with `msg_submit()`. The routing policy is the `switch` described in
 ```c
 #include "msg_router.h"
 
+#define MSG_PEER_NONE 0xFFFFu
+
 typedef enum {
     MSG_IF_USB_CDC, MSG_IF_BLE, MSG_IF_UART_RADIO, MSG_IF_UART_LORA, MSG_IF_COUNT,
 } msg_iface_t;
 
-typedef void (*msg_sink_fn_t)(const uint8_t *data, size_t len);
+typedef struct {
+    msg_iface_t iface;   /* source interface                       */
+    uint16_t    peer;    /* source peer (BLE conn_handle) or MSG_PEER_NONE */
+} msg_origin_t;
+
+typedef void (*msg_sink_fn_t)(const msg_origin_t *origin, const uint8_t *data, size_t len);
 
 esp_err_t msg_router_init(void);
 esp_err_t msg_router_register_sink(msg_iface_t dest, msg_sink_fn_t fn); /* plug an interface in */
-esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len);  /* producer entry point */
-esp_err_t msg_router_start(void);                                        /* spawn the task */
-void      msg_router_send_to(msg_iface_t dest, const uint8_t *data, size_t len); /* explicit forward */
+esp_err_t msg_submit      (msg_iface_t src, const uint8_t *data, size_t len);          /* single-port source */
+esp_err_t msg_submit_from (const msg_origin_t *origin, const uint8_t *data, size_t len); /* BLE (carries sender) */
+esp_err_t msg_router_start(void);                                                     /* spawn the task */
+void      msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,            /* explicit forward */
+                             const uint8_t *data, size_t len);
 ```
 
 ### `uart_bridge`

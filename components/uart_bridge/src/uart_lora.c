@@ -23,8 +23,11 @@ static QueueHandle_t s_evt_queue;
 
 /* --------------------------------------------------------------- sink (TX) */
 
-static void uart_lora_sink(const uint8_t *data, size_t len)
+static void uart_lora_sink(const msg_origin_t *origin, const uint8_t *data, size_t len)
 {
+    if (origin->iface == MSG_IF_UART_LORA) {
+        return; /* don't echo back to the Lora UART */
+    }
     uart_write_bytes(s_port, data, len);
 }
 

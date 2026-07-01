@@ -54,7 +54,7 @@
 
 | Направление | Поведение |
 |-------------|-----------|
-| Любой интерфейс → все остальные | Кадр, принятый на любом интерфейсе, по умолчанию пересылается **во все остальные** (hub / broadcast). Каждый интерфейс помечает свои кадры своим id в роутере. |
+| Любой интерфейс → все остальные | Кадр, принятый на любом интерфейсе, по умолчанию доставляется **во все** sink'и. Каждый sink пропускает своего отправителя: одноканальные интерфейсы (USB, UART Radio, UART Lora) не возвращают кадр в ту же линию; **BLE пересылает всем клиентам, *кроме* отправителя** (`conn_handle` отправителя передаётся в кадре как origin и попадает в `nordic_uart_send_except()`). |
 
 Мост **бинарно-прозрачный** (без построчной буферизации и трансляции CR-LF),
 поэтому подходит как для CPS-протокола рации, так и для обычных AT-команд.
@@ -64,22 +64,50 @@
 Логика маршрутизации сосредоточена в одном месте: `switch` по источнику в
 функции `route_message()`
 ([`components/msg_router/src/msg_router.c`](components/msg_router/src/msg_router.c)).
-По умолчанию каждый `case` пересылает кадр во все остальные интерфейсы. Чтобы
-ограничить источник конкретным набором адресатов, отредактируйте нужный `case` и
-отправляйте явно через `msg_router_send_to()`:
+По умолчанию каждый `case` доставляет кадр всем sink'ам, а каждый sink исключает
+своего отправителя (поэтому BLE-отправитель никогда не получает свой кадр
+обратно — см. [Без обратной отправки отправителю BLE](#без-обратной-отправки-отправителю-ble)).
+Чтобы ограничить источник конкретным набором адресатов, отредактируйте нужный
+`case` и отправляйте явно через `msg_router_send_to()`:
 
 ```c
-static void route_message(msg_iface_t src, const uint8_t *data, size_t len)
+static void route_message(const msg_origin_t *origin,
+                          const uint8_t *data, size_t len)
 {
-    switch (src) {
+    switch (origin->iface) {
     case MSG_IF_UART_LORA:
         // Lora -> только в BLE
-        msg_router_send_to(MSG_IF_BLE, data, len);
+        msg_router_send_to(MSG_IF_BLE, origin, data, len);
         break;
     /* ...остальные case'ы сохраняют поведение hub по умолчанию... */
     }
 }
 ```
+
+#### Без обратной отправки отправителю BLE
+
+Поскольку BLE многоканальный, BLE-кадр несёт `conn_handle` отправителя как
+свой origin (`msg_origin_t.peer`). `main.c` помещает его через
+`msg_submit_from()`:
+
+```c
+msg_origin_t origin = { .iface = MSG_IF_BLE, .peer = item->conn_handle };
+msg_submit_from(&origin, item->data, item->len);
+```
+
+а BLE-sink исключает этого клиента:
+
+```c
+if (origin->iface == MSG_IF_BLE && origin->peer != MSG_PEER_NONE)
+    nordic_uart_send_except(origin->peer, data, len);  // все, кроме отправителя
+else
+    nordic_uart_send(data, len);                       // broadcast (напр. ответ рации)
+```
+
+Таким образом, ввод клиента A доходит до рации, UART-каналов **и клиентов
+B/C/D — но не до A**. Чтобы полностью изолировать BLE-клиентов друг от друга
+(без фанаута между ними), уберите BLE-sink из `MSG_IF_BLE` case (см. комментарий
+в `msg_router.c`).
 
 ### BLE-сервис
 
@@ -199,17 +227,26 @@ Bridge* / *Message Router*) и пересоберите.
 ```c
 #include "msg_router.h"
 
+#define MSG_PEER_NONE 0xFFFFu
+
 typedef enum {
     MSG_IF_USB_CDC, MSG_IF_BLE, MSG_IF_UART_RADIO, MSG_IF_UART_LORA, MSG_IF_COUNT,
 } msg_iface_t;
 
-typedef void (*msg_sink_fn_t)(const uint8_t *data, size_t len);
+typedef struct {
+    msg_iface_t iface;   /* интерфейс-источник                       */
+    uint16_t    peer;    /* клиент-источник (BLE conn_handle) или MSG_PEER_NONE */
+} msg_origin_t;
+
+typedef void (*msg_sink_fn_t)(const msg_origin_t *origin, const uint8_t *data, size_t len);
 
 esp_err_t msg_router_init(void);
 esp_err_t msg_router_register_sink(msg_iface_t dest, msg_sink_fn_t fn); /* подключить интерфейс */
-esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len);  /* точка входа производителей */
-esp_err_t msg_router_start(void);                                        /* запустить задачу */
-void      msg_router_send_to(msg_iface_t dest, const uint8_t *data, size_t len); /* явная пересылка */
+esp_err_t msg_submit      (msg_iface_t src, const uint8_t *data, size_t len);          /* одноканальный источник */
+esp_err_t msg_submit_from (const msg_origin_t *origin, const uint8_t *data, size_t len); /* BLE (несёт отправителя) */
+esp_err_t msg_router_start(void);                                                     /* запустить задачу */
+void      msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,            /* явная пересылка */
+                             const uint8_t *data, size_t len);
 ```
 
 ### `uart_bridge`

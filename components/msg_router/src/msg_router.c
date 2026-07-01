@@ -22,9 +22,9 @@ static const char *TAG = "MSG_ROUTER";
 
 /** One routed frame. Payload bytes follow the header (flexible array member). */
 typedef struct {
-    msg_iface_t src;   /**< source interface             */
-    uint16_t    len;   /**< bytes in data[]              */
-    uint8_t     data[];/**< raw payload, binary-safe     */
+    msg_origin_t origin;/**< source interface + peer          */
+    uint16_t     len;   /**< bytes in data[]                   */
+    uint8_t      data[];/**< raw payload, binary-safe          */
 } msg_item_t;
 
 static RingbufHandle_t s_buf;
@@ -55,9 +55,11 @@ esp_err_t msg_router_register_sink(msg_iface_t dest, msg_sink_fn_t fn)
     return ESP_OK;
 }
 
-esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len)
+esp_err_t msg_submit_from(const msg_origin_t *origin,
+                          const uint8_t *data, size_t len)
 {
-    if (s_buf == NULL || src >= MSG_IF_COUNT || data == NULL || len == 0) {
+    if (s_buf == NULL || origin == NULL || origin->iface >= MSG_IF_COUNT ||
+        data == NULL || len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
     if (len > 0xFFFF) {
@@ -68,17 +70,17 @@ esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len)
     msg_item_t *item = malloc(item_size);
     if (item == NULL) {
         ESP_LOGE(TAG, "submit malloc fail (%u bytes from if=%d)",
-                 (unsigned)item_size, src);
+                 (unsigned)item_size, origin->iface);
         return ESP_ERR_NO_MEM;
     }
-    item->src = src;
+    item->origin = *origin;
     item->len = (uint16_t)len;
     memcpy(item->data, data, len);
 
     if (xRingbufferSend(s_buf, item, item_size,
                         pdMS_TO_TICKS(MSG_SUBMIT_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "Router buffer full, dropping %u byte(s) from if=%d",
-                 (unsigned)len, src);
+                 (unsigned)len, origin->iface);
         free(item);
         return ESP_ERR_NO_MEM;
     }
@@ -86,62 +88,82 @@ esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len)
     return ESP_OK;
 }
 
+esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len)
+{
+    msg_origin_t origin = { .iface = src, .peer = MSG_PEER_NONE };
+    return msg_submit_from(&origin, data, len);
+}
+
 /* --------------------------------------------------------------- routing */
 
-/** Forward to every destination EXCEPT the source itself. */
-static void route_to_all_except(msg_iface_t src, const uint8_t *data, size_t len)
+/**
+ * Default delivery: hand the frame to EVERY registered sink. Each sink is
+ * responsible for not echoing it back to its own originator (single-port
+ * interfaces skip their own interface; BLE skips only the sender peer). This
+ * keeps the router generic while still enforcing "no loop-back".
+ */
+static void deliver_to_all(const msg_origin_t *origin,
+                           const uint8_t *data, size_t len)
 {
     for (int d = 0; d < MSG_IF_COUNT; d++) {
-        if (d == src) {
-            continue; /* never echo back to the originator */
-        }
         if (s_sinks[d]) {
-            s_sinks[d](data, len);
+            s_sinks[d](origin, data, len);
         }
+    }
+}
+
+void msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,
+                        const uint8_t *data, size_t len)
+{
+    if (dest < MSG_IF_COUNT && s_sinks[dest]) {
+        s_sinks[dest](origin, data, len);
     }
 }
 
 /**
  * Per-source routing policy.
  *
- * Default behaviour below: forward to ALL other interfaces (hub / broadcast).
- * To restrict a source to a specific set of destinations, edit the matching
- * case and forward explicitly with msg_router_send_to(), e.g.:
+ * Default behaviour: deliver to all interfaces (sinks self-exclude the
+ * originator). To restrict a source to a specific set of destinations, edit
+ * the matching case and forward explicitly with msg_router_send_to(), e.g.:
  *
  *     case MSG_IF_UART_LORA:
  *         // Lora -> BLE only
- *         msg_router_send_to(MSG_IF_BLE, data, len);
+ *         msg_router_send_to(MSG_IF_BLE, origin, data, len);
+ *         break;
+ *
+ * To completely suppress BLE peer fan-out (so BLE clients are isolated from
+ * each other), simply don't call the BLE sink from the MSG_IF_BLE case, e.g.:
+ *
+ *     case MSG_IF_BLE:
+ *         msg_router_send_to(MSG_IF_USB_CDC,    origin, data, len);
+ *         msg_router_send_to(MSG_IF_UART_RADIO, origin, data, len);
+ *         msg_router_send_to(MSG_IF_UART_LORA,  origin, data, len);
  *         break;
  */
-void msg_router_send_to(msg_iface_t dest, const uint8_t *data, size_t len)
+static void route_message(const msg_origin_t *origin,
+                          const uint8_t *data, size_t len)
 {
-    if (dest < MSG_IF_COUNT && s_sinks[dest]) {
-        s_sinks[dest](data, len);
-    }
-}
-
-static void route_message(msg_iface_t src, const uint8_t *data, size_t len)
-{
-    switch (src) {
+    switch (origin->iface) {
     case MSG_IF_USB_CDC:
-        route_to_all_except(MSG_IF_USB_CDC, data, len);
+        deliver_to_all(origin, data, len);
         break;
 
     case MSG_IF_BLE:
-        route_to_all_except(MSG_IF_BLE, data, len);
+        deliver_to_all(origin, data, len);
         break;
 
     case MSG_IF_UART_RADIO:
-        route_to_all_except(MSG_IF_UART_RADIO, data, len);
+        deliver_to_all(origin, data, len);
         break;
 
     case MSG_IF_UART_LORA:
-        route_to_all_except(MSG_IF_UART_LORA, data, len);
+        deliver_to_all(origin, data, len);
         break;
 
     default:
         ESP_LOGW(TAG, "Unknown source if=%d, dropping %u byte(s)",
-                 src, (unsigned)len);
+                 origin->iface, (unsigned)len);
         break;
     }
 }
@@ -158,8 +180,9 @@ void msg_routing_task(void *arg)
             continue;
         }
 
-        ESP_LOGD(TAG, "route if=%d -> %u byte(s)", item->src, item->len);
-        route_message(item->src, item->data, item->len);
+        ESP_LOGD(TAG, "route if=%d peer=%u -> %u byte(s)",
+                 item->origin.iface, item->origin.peer, item->len);
+        route_message(&item->origin, item->data, item->len);
 
         vRingbufferReturnItem(s_buf, (void *)item);
     }
