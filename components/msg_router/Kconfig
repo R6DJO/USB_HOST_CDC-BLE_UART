@@ -26,4 +26,15 @@ menu "Message Router"
             Stack for each sink's dedicated delivery task (one task per
             registered sink).
 
+    config MSG_ROUTER_STATS_PERIOD_MS
+        int "Drop-stats log period (ms)"
+        default 30000
+        range 0 3600000
+        help
+            How often to log cumulative per-interface drop counters (central
+            buffer drops per source + per-sink queue drops per destination).
+            Only logs when a counter changed since the last log. Set to 0 to
+            disable the periodic log -- counters are still kept and readable on
+            demand via msg_router_log_stats().
+
 endmenu

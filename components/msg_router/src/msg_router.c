@@ -18,9 +18,12 @@
 #include "msg_router.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "MSG_ROUTER";
@@ -58,6 +61,98 @@ static const char *const SINK_TASK_NAMES[MSG_IF_COUNT] = {
     [MSG_IF_UART_RADIO] = "sink_urad",
     [MSG_IF_UART_LORA]  = "sink_ulora",
 };
+
+/* ----------------------------------------------------------- drop statistics */
+/* Cumulative per-interface drop counters, touched from many tasks (producers
+ * in msg_submit, the routing task in sink_enqueue, the esp_timer task in the
+ * logger). Guarded by a critical section; each critical section is tiny (one
+ * increment / one memcpy). */
+static const char *const IFACE_NAMES[MSG_IF_COUNT] = {
+    [MSG_IF_USB_CDC]    = "usb",
+    [MSG_IF_BLE]        = "ble",
+    [MSG_IF_UART_RADIO] = "urad",
+    [MSG_IF_UART_LORA]  = "ulora",
+};
+
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_submit_drops[MSG_IF_COUNT]; /* central-buffer drops, per source */
+static uint32_t s_sink_drops[MSG_IF_COUNT];   /* per-sink queue drops, per dest   */
+static uint32_t s_last_sub[MSG_IF_COUNT];     /* last logged (change detect)      */
+static uint32_t s_last_snk[MSG_IF_COUNT];
+static esp_timer_handle_t s_stats_timer;
+
+static void stats_inc_submit(msg_iface_t src)
+{
+    if (src >= MSG_IF_COUNT) {
+        return;
+    }
+    portENTER_CRITICAL(&s_stats_lock);
+    s_submit_drops[src]++;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
+static void stats_inc_sink(msg_iface_t dest)
+{
+    if (dest >= MSG_IF_COUNT) {
+        return;
+    }
+    portENTER_CRITICAL(&s_stats_lock);
+    s_sink_drops[dest]++;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
+/** Log cumulative drop totals, but only if any counter changed since the last
+ *  call (so a quiet system produces no output). Public via the header. */
+void msg_router_log_stats(void)
+{
+    uint32_t sub[MSG_IF_COUNT], snk[MSG_IF_COUNT];
+    portENTER_CRITICAL(&s_stats_lock);
+    memcpy(sub, s_submit_drops, sizeof sub);
+    memcpy(snk, s_sink_drops, sizeof snk);
+    portEXIT_CRITICAL(&s_stats_lock);
+
+    bool changed = false;
+    for (int i = 0; i < MSG_IF_COUNT; i++) {
+        if (sub[i] != s_last_sub[i] || snk[i] != s_last_snk[i]) {
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return;
+    }
+
+    /* Compact one-liner: drop totals: submit{usb=N ble=N ...} sink{...} */
+    char buf[160];
+    int off = snprintf(buf, sizeof buf, "drop totals: submit{");
+    for (int i = 0; i < MSG_IF_COUNT; i++) {
+        if (off >= (int)sizeof buf) break;
+        off += snprintf(buf + off, sizeof buf - off, "%s%s=%lu",
+                        i ? " " : "", IFACE_NAMES[i], (unsigned long)sub[i]);
+    }
+    if (off < (int)sizeof buf) {
+        off += snprintf(buf + off, sizeof buf - off, "} sink{");
+    }
+    for (int i = 0; i < MSG_IF_COUNT; i++) {
+        if (off >= (int)sizeof buf) break;
+        off += snprintf(buf + off, sizeof buf - off, "%s%s=%lu",
+                        i ? " " : "", IFACE_NAMES[i], (unsigned long)snk[i]);
+    }
+    if (off < (int)sizeof buf) {
+        snprintf(buf + off, sizeof buf - off, "}");
+    }
+    ESP_LOGI(TAG, "%s", buf);
+
+    for (int i = 0; i < MSG_IF_COUNT; i++) {
+        s_last_sub[i] = sub[i];
+        s_last_snk[i] = snk[i];
+    }
+}
+
+static void stats_timer_cb(void *arg)
+{
+    (void)arg;
+    msg_router_log_stats();
+}
 
 /* ----------------------------------------------------------- sink delivery */
 
@@ -150,6 +245,7 @@ esp_err_t msg_submit_from(const msg_origin_t *origin,
                                pdMS_TO_TICKS(MSG_SUBMIT_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "Router buffer full, dropping %u byte(s) from if=%d",
                  (unsigned)len, origin->iface);
+        stats_inc_submit(origin->iface);
         return ESP_ERR_NO_MEM;
     }
     item->origin = *origin;
@@ -184,6 +280,7 @@ static void sink_enqueue(msg_iface_t dest, const msg_origin_t *origin,
         /* Queue full: drop the newest frame for THIS sink only. */
         ESP_LOGW(TAG, "sink if=%d queue full, dropping %u byte(s)",
                  dest, (unsigned)len);
+        stats_inc_sink(dest);
         return;
     }
     item->origin = *origin;
@@ -274,5 +371,21 @@ esp_err_t msg_router_start(void)
     BaseType_t ok = xTaskCreate(msg_routing_task, "msg_routing",
                                 MSG_ROUTER_TASK_STACK, NULL,
                                 MSG_ROUTER_TASK_PRIO, NULL);
-    return (ok == pdTRUE) ? ESP_OK : ESP_FAIL;
+    if (ok != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    /* Periodic drop-stats logger. 0 disables the timer; counters are still
+     * kept and readable on demand via msg_router_log_stats(). */
+    if (CONFIG_MSG_ROUTER_STATS_PERIOD_MS > 0) {
+        const esp_timer_create_args_t args = {
+            .callback = stats_timer_cb,
+            .name = "rt_stats",
+        };
+        if (esp_timer_create(&args, &s_stats_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_stats_timer,
+                                     CONFIG_MSG_ROUTER_STATS_PERIOD_MS * 1000ULL);
+        }
+    }
+    return ESP_OK;
 }

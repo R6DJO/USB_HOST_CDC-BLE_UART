@@ -196,6 +196,7 @@ Bridge* / *Message Router*):
 | `CONFIG_MSG_ROUTER_BUF_SIZE`         | `8192`      | Central routing ring buffer (bytes) |
 | `CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE`  | `4096`      | Per-sink delivery ring buffer (bytes); drops newest on overflow |
 | `CONFIG_MSG_ROUTER_SINK_TASK_STACK`  | `3072`      | Stack for each sink's dedicated delivery task |
+| `CONFIG_MSG_ROUTER_STATS_PERIOD_MS` | `30000`     | Drop-counters log period (ms); `0` = off |
 
 USB CDC parameters are set under *Component config → USB CDC* (`idf.py
 menuconfig`): radio VID/PID (default `0x1FC9:0x0094`), line-coding baud rate
@@ -370,3 +371,9 @@ I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
   more).
 - The USB radio must stay powered; on sudden USB disconnect the firmware reopens
   the CDC device automatically.
+- **Frame drops are observable:** drop counters (central buffer per source +
+  per-sink queues per destination) are logged every `CONFIG_MSG_ROUTER_STATS_PERIOD_MS`
+  (default 30 s), only when changed; on demand via `msg_router_log_stats()`.
+- **USB errors don't reboot the bridge:** line-coding / `cdc_acm_host_close`
+  failures during radio connect/disconnect are logged and trigger an open retry
+  instead of an abort.

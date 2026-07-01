@@ -119,6 +119,14 @@ void msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,
  */
 esp_err_t msg_router_start(void);
 
+/**
+ * Log cumulative per-interface drop counters (central buffer + per-sink
+ * queues), but only if any counter changed since the previous call. Safe to
+ * call from any task; also fired automatically every
+ * CONFIG_MSG_ROUTER_STATS_PERIOD_MS.
+ */
+void msg_router_log_stats(void);
+
 /** The routing task entry point (exposed for unit testing / custom creation). */
 void msg_routing_task(void *arg);
 

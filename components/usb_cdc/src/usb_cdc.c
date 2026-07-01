@@ -92,7 +92,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
     case CDC_ACM_HOST_ERROR:
         ESP_LOGE(TAG, "CDC-ACM error, err_no = %i", event->data.error);
         break;
-    case CDC_ACM_HOST_DEVICE_DISCONNECTED:
+    case CDC_ACM_HOST_DEVICE_DISCONNECTED: {
         ESP_LOGI(TAG, "Device suddenly disconnected");
         /* Null cdc_dev under the lock first: this waits for any in-flight sink
          * tx to finish, so by the time close() runs the sink has released the
@@ -101,9 +101,15 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
         xSemaphoreTake(s_cdc_mutex, portMAX_DELAY);
         s_cdc_dev = NULL;
         xSemaphoreGive(s_cdc_mutex);
-        ESP_ERROR_CHECK(cdc_acm_host_close(event->data.cdc_hdl));
+        /* Best-effort close: the device is already gone, so a failure here must
+         * not abort the bridge -- we still want to re-open it below. */
+        esp_err_t cerr = cdc_acm_host_close(event->data.cdc_hdl);
+        if (cerr != ESP_OK) {
+            ESP_LOGW(TAG, "cdc_acm_host_close: %s", esp_err_to_name(cerr));
+        }
         xSemaphoreGive(s_disconnected_sem);
         break;
+    }
     case CDC_ACM_HOST_SERIAL_STATE:
         ESP_LOGI(TAG, "Serial state notif 0x%04X", event->data.serial_state.val);
         break;
@@ -124,7 +130,12 @@ static void usb_lib_task(void *arg)
         uint32_t event_flags;
         usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-            ESP_ERROR_CHECK(usb_host_device_free_all());
+            /* Best-effort: a failure here must not kill the USB event task --
+             * without it no USB recovery is possible at all. */
+            esp_err_t ferr = usb_host_device_free_all();
+            if (ferr != ESP_OK) {
+                ESP_LOGW(TAG, "usb_host_device_free_all: %s", esp_err_to_name(ferr));
+            }
         }
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
             ESP_LOGI(TAG, "USB: All devices freed");
@@ -161,24 +172,37 @@ static void usb_cdc_task(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(CDC_OPEN_SETTLE_MS));
 
-        /* Configure line coding: <baud> 8N1.
-         * One SET, then a GET only to log the values actually applied by the
-         * device (some CDC devices clamp/ignore requested settings). */
+        /* Configure line coding: <baud> 8N1. These control transfers can
+         * fail on a flaky/slow device right after open; on failure close the
+         * half-opened handle and retry the whole open -- a reboot would defeat
+         * the reconnect logic. */
         cdc_acm_line_coding_t line_coding = {
             .dwDTERate   = CONFIG_USB_CDC_BAUDRATE,
             .bDataBits   = 8,
             .bParityType = 0,
             .bCharFormat = 1,
         };
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(new_dev, &line_coding));
+        esp_err_t cfg_err = cdc_acm_host_line_coding_set(new_dev, &line_coding);
+        if (cfg_err == ESP_OK) {
+            cfg_err = cdc_acm_host_set_control_line_state(new_dev, true, false);
+        }
+        if (cfg_err != ESP_OK) {
+            ESP_LOGW(TAG, "device setup failed (%s); closing and retrying",
+                     esp_err_to_name(cfg_err));
+            cdc_acm_host_close(new_dev);   /* best effort */
+            vTaskDelay(pdMS_TO_TICKS(CDC_OPEN_RETRY_MS));
+            continue;
+        }
 
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(new_dev, &line_coding));
-        ESP_LOGI(TAG, "Line Get: Rate: %" PRIu32 ", Stop bits: %" PRIu8
-                 ", Parity: %" PRIu8 ", Databits: %" PRIu8,
-                 line_coding.dwDTERate, line_coding.bCharFormat,
-                 line_coding.bParityType, line_coding.bDataBits);
-
-        ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(new_dev, true, false));
+        /* GET is informational only (log what the device actually applied);
+         * a failure here is harmless and must not block publishing. */
+        cdc_acm_line_coding_t applied;
+        if (cdc_acm_host_line_coding_get(new_dev, &applied) == ESP_OK) {
+            ESP_LOGI(TAG, "Line Get: Rate: %" PRIu32 ", Stop bits: %" PRIu8
+                     ", Parity: %" PRIu8 ", Databits: %" PRIu8,
+                     applied.dwDTERate, applied.bCharFormat,
+                     applied.bParityType, applied.bDataBits);
+        }
 
         /* Publish the fully-configured handle atomically: the sink sees either
          * NULL (skips) or a ready device -- never a half-configured one. */

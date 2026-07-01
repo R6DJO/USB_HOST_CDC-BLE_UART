@@ -201,6 +201,7 @@ Bridge* / *Message Router*):
 | `CONFIG_MSG_ROUTER_BUF_SIZE`         | `8192`      | Центральный буфер маршрутизации (байт) |
 | `CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE`  | `4096`      | Приватный буфер доставки per-sink (байт); drop-newest при переполнении |
 | `CONFIG_MSG_ROUTER_SINK_TASK_STACK`  | `3072`      | Стек задачи доставки каждого sink'а |
+| `CONFIG_MSG_ROUTER_STATS_PERIOD_MS` | `30000`     | Период лога счётчиков дропов (мс); `0` = выкл |
 
 Параметры USB CDC задаются в *Component config → USB CDC* (`idf.py
 menuconfig`): VID/PID рации (по умолч. `0x1FC9:0x0094`), скорость line coding
@@ -378,3 +379,8 @@ I (xxx) BLE_BRIDGE: peer=0 -> 9 byte(s)
   для большего числа).
 - USB-рация должна оставаться запитанной; при внезапном USB-разрыве прошивка
   автоматически переподключается к CDC-устройству.
+- **Потери кадров наблюдаемы:** счётчики дропов (центральный буфер по источнику +
+  per-sink очереди по адресату) логируются каждые `CONFIG_MSG_ROUTER_STATS_PERIOD_MS`
+  (по умолч. 30 с), только если изменились; по запросу — `msg_router_log_stats()`.
+- **USB-ошибки не роняют мост:** сбои line-coding / `cdc_acm_host_close` при
+  подключении/отключении рации логируются и приводят к повтору open, а не к ребуту.
