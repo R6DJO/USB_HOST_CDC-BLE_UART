@@ -81,6 +81,7 @@ static uint32_t s_last_sub[MSG_IF_COUNT];     /* last logged (change detect)    
 static uint32_t s_last_snk[MSG_IF_COUNT];
 static esp_timer_handle_t s_stats_timer;
 
+/* Count a frame dropped at the central buffer (producer side, per source). */
 static void stats_inc_submit(msg_iface_t src)
 {
     if (src >= MSG_IF_COUNT) {
@@ -91,6 +92,7 @@ static void stats_inc_submit(msg_iface_t src)
     portEXIT_CRITICAL(&s_stats_lock);
 }
 
+/* Count a frame dropped at a per-sink queue (consumer side, per destination). */
 static void stats_inc_sink(msg_iface_t dest)
 {
     if (dest >= MSG_IF_COUNT) {

@@ -45,8 +45,8 @@ static const ble_uuid128_t NUS_TX_UUID = /* us -> peer (notify) */
 #define NUS_PEER_ARRAY_SIZE (CONFIG_BT_NIMBLE_MAX_CONNECTIONS + 1)
 #define NUS_DEFAULT_MTU     23      /* minimal ATT MTU -> 20 byte payload  */
 #define NUS_NOTIFY_TIMEOUT  20      /* xRingbufferSend wait, ms            */
-#define NUS_ENOMEM_RETRY_MS 50
-#define NUS_MAX_RETRIES     10
+#define NUS_ENOMEM_RETRY_MS 50      /* delay between mbuf-alloc retries, ms   */
+#define NUS_MAX_RETRIES     10      /* give-up threshold for a single chunk   */
 
 typedef struct {
     bool     connected;
@@ -77,6 +77,8 @@ typedef struct {
 
 /* ------------------------------------------------------------------ helpers */
 
+/* True if conn_handle indexes a valid nus_peers[] slot. The table is sized
+ * MAX+1 (see NUS_PEER_ARRAY_SIZE), so any real NimBLE handle fits. */
 static inline bool nus_handle_ok(uint16_t h)
 {
     return h < NUS_PEER_ARRAY_SIZE;
@@ -196,6 +198,9 @@ static void nus_advertise(void)
 
 /* --------------------------------------------------------------- GAP events */
 
+/** Central GAP event dispatcher (connect / disconnect / subscribe / MTU /
+ *  advertising-complete). Runs in the NimBLE host task context, so every
+ *  branch keeps the per-peer state mutations under nus_lock and never blocks. */
 static int nus_gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -261,6 +266,10 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
 
 /* ------------------------------------------------------------- GATT service */
 
+/** GATT access callback for the NUS RX/TX characteristics. Only writes to the
+ *  RX char (peer -> us) carry data: each write is framed with the sender's
+ *  conn_handle and pushed into the RX ring buffer. Reads of the TX char are
+ *  no-ops (TX is notify-only). */
 static int nus_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                          struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -306,6 +315,10 @@ static int nus_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
+/* Nordic UART Service GATT table: one primary service with two characteristics
+ * -- RX (peer writes data to us) and TX (we notify peers). The TX char's
+ * value handle is captured into nus_tx_val_handle so the GAP subscribe event
+ * can tell TX subscriptions apart from any other characteristic. */
 static const struct ble_gatt_svc_def nus_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -535,6 +548,9 @@ uint8_t nordic_uart_subscribed_count(void)
 
 /* --------------------------------------------------------------- lifecycle */
 
+/** BLE-host "synced with controller" callback: the controller is ready, so
+ *  resolve our preferred address type and begin advertising. Runs once after
+ *  nimble_port_init(). */
 static void nus_on_sync(void)
 {
     int rc = ble_hs_id_infer_auto(0, &nus_own_addr_type);
@@ -542,10 +558,13 @@ static void nus_on_sync(void)
     nus_advertise();
 }
 
+/** NimBLE host task. nimble_port_run() blocks until nimble_port_stop() is
+ *  called (from nordic_uart_stop()), after which we tear down the FreeRTOS
+ *  port glue. */
 static void nus_host_task(void *param)
 {
     (void)param;
-    nimble_port_run(); /* returns only when nimble_port_stop() is called */
+    nimble_port_run();
     nimble_port_freertos_deinit();
 }
 

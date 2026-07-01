@@ -94,6 +94,11 @@ static void uart_lora_sink(const msg_origin_t *o, const uint8_t *d, size_t l)
 
 /* --------------------------------------------------------------- RX task */
 
+/** UART RX pump: receive every byte batch reported by the driver and forward
+ *  it to the router tagged with this bridge's iface. Runs in its own task
+ *  (Lora: started at init; Radio: started by the auto-baud task once the link
+ *  is confirmed). See the chunked-drain note below for why a single event is
+ *  read to exhaustion. */
 static void bridge_rx_task(void *arg)
 {
     uart_bridge_t *b = (uart_bridge_t *)arg;
@@ -140,6 +145,8 @@ static void bridge_rx_task(void *arg)
 
 /* --------------------------------------------------------------- auto-baud */
 
+/* Substring scan for "OK" anywhere in @p buf (AT replies are not guaranteed
+ * to be aligned or free of leading CR/LF). */
 static bool resp_contains_ok(const uint8_t *buf, int len)
 {
     for (int i = 0; i + 1 < len; i++) {
@@ -255,6 +262,11 @@ static void bridge_autobaud_task(void *arg)
 
 /* --------------------------------------------------------------- install */
 
+/** Common bring-up shared by both instances: wire the config, install the UART
+ *  driver (double-sized RX/TX buffers + an event queue), apply 8N1 line coding
+ *  + pins, and self-register the router sink. For Radio the published baud
+ *  starts at 0 (outgoing frames dropped) until the auto-baud task confirms a
+ *  rate. */
 static esp_err_t bridge_install(uart_bridge_t *b, const uart_bridge_cfg_t *cfg,
                                 msg_sink_fn_t sink)
 {
