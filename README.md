@@ -190,7 +190,9 @@ Bridge* / *Message Router*):
 | `CONFIG_UART_LORA_RX_GPIO`      | `47`        | RX ← Lora TX |
 | `CONFIG_UART_LORA_BAUDRATE`     | `9600`      | Fixed Lora baud rate |
 | `CONFIG_UART_LORA_BUF_SIZE`     | `512`       | Lora UART scratch buffer |
-| `CONFIG_MSG_ROUTER_BUF_SIZE`    | `8192`      | Central routing ring buffer (bytes) |
+| `CONFIG_MSG_ROUTER_BUF_SIZE`         | `8192`      | Central routing ring buffer (bytes) |
+| `CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE`  | `4096`      | Per-sink delivery ring buffer (bytes); drops newest on overflow |
+| `CONFIG_MSG_ROUTER_SINK_TASK_STACK`  | `3072`      | Stack for each sink's dedicated delivery task |
 
 USB CDC parameters are set in [`main/main.c`](main/main.c): **115200 8N1**, DTR
 asserted, RTS deasserted. Adjust `MD9600_USB_DEVICE_VID` / `PID` there if your
@@ -208,16 +210,28 @@ The firmware is split into three local components under
 | Component | Role |
 |-----------|------|
 | [`nordic_uart_multi`](components/nordic_uart_multi) | Multi-connection BLE Nordic UART Service peripheral |
-| [`msg_router`](components/msg_router)              | Central routing queue + `msg_routing` task + per-source `switch` |
+| [`msg_router`](components/msg_router)              | Central routing queue + `msg_routing` task + per-sink async queues + per-source `switch` |
 | [`uart_bridge`](components/uart_bridge)            | UART Radio (auto-baud) + UART Lora (fixed baud) |
 
 ### `msg_router`
 
-A single FreeRTOS ring buffer queues frames tagged with their source; one
-`msg_routing` task drains it and dispatches each frame to destination
-"sinks" registered with `msg_router_register_sink()`. Producers push frames
-with `msg_submit()`. The routing policy is the `switch` described in
-[Routing](#routing).
+Asynchronous per-sink delivery (one private queue **and** one dedicated task
+per sink):
+
+1. Producers push frames into a single central ring buffer (`msg_submit()` /
+   `msg_submit_from()`).
+2. The `msg_routing` task drains that buffer and, for each frame, enqueues a
+   copy into the **private queue** of every registered sink — non-blocking and
+   **drop-on-full**. The routing policy is the `switch` over the source id in
+   `route_message()` (see [Routing](#routing)).
+3. Each sink owns a dedicated delivery task that drains its own queue and calls
+   the real delivery function, which may block freely (USB tx, BLE notify,
+   UART write) — only that one sink is affected; the router and every other
+   sink keep running. An overflowing sink drops only its own newest frames.
+
+Registering a sink with `msg_router_register_sink()` both creates its private
+queue and spawns its delivery task, so all sinks must be registered **before**
+`msg_router_start()`.
 
 ```c
 #include "msg_router.h"
