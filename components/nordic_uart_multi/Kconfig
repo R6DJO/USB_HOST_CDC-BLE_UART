@@ -1,0 +1,11 @@
+menu "Nordic UART (multi-connection) Configuration"
+
+    config NORDIC_UART_RX_BUFFER_SIZE
+        int "BLE RX ring buffer size (bytes)"
+        default 4096
+        range 256 65536
+        help
+            Size of the FreeRTOS ring buffer that holds incoming BLE data
+            (one item per write, tagged with the source connection handle).
+
+endmenu

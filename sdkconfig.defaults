@@ -1,0 +1,21 @@
+# Persistent defaults for the multi-connection BLE-UART bridge.
+# Applied on `idf.py reconfigure` / clean builds.
+
+# --- BLE: allow up to 4 simultaneous connections ---
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# up to 4 BLE peers
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=4
+
+# 4 connections + advertising + margin (controller BLE activities)
+CONFIG_BT_CTRL_BLE_MAX_ACT=8
+
+CONFIG_BT_NIMBLE_MAX_BONDS=4
+CONFIG_BT_NIMBLE_GATT_MAX_PROCS=8
+
+# Legacy (non-extended) advertising is used by the Nordic UART service.
+# CONFIG_BT_NIMBLE_EXT_ADV is not set
+
+# --- Nordic UART component ---
+CONFIG_NORDIC_UART_RX_BUFFER_SIZE=4096
