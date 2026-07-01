@@ -23,7 +23,7 @@
 static const char *TAG = "BLE_BRIDGE";
 
 #define BLE2RT_TASK_STACK 2048
-#define BLE2RT_TASK_PRIO  1
+#define BLE2RT_TASK_PRIO  5
 
 /* ----------------------------------------------------------- router sink (TX) */
 

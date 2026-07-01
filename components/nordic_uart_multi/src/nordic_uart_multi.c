@@ -336,41 +336,84 @@ typedef enum {
     NUS_SEND_ALL_EXCEPT, /* send to every subscribed peer except one      */
 } nus_send_mode_t;
 
-/* Send one chunked notification to a single peer.
- * Returns 0 on success, or a BLE_HS_* error code. On BLE_HS_ENOTCONN the
- * peer is dropped (it has gone away). */
+/* Send one frame to a single peer, chunked by ATT MTU. The whole frame is
+ * delivered ATOMICALLY: every chunk's mbuf is allocated first, and only then
+ * do we start notifying. If any allocation fails, the already-allocated mbufs
+ * are freed and NOTHING is sent -- so a peer never receives a partial frame
+ * (which would silently corrupt a binary-transparent stream).
+ *
+ * ble_gatts_notify_custom() takes ownership of the mbuf on every return path
+ * (the BLE stack frees it), matching the original streaming implementation,
+ * so we never free an mbuf we already handed to it.
+ * Returns 0 on success, or a BLE_HS_* error code. */
 static int nus_peer_send(uint16_t h, uint16_t mtu, const uint8_t *data, size_t len)
 {
     size_t chunk = (mtu ? mtu : NUS_DEFAULT_MTU) - 3; /* 3 bytes ATT header */
+    if (chunk == 0) {
+        chunk = 1;
+    }
+    int nchunks = (int)((len + chunk - 1) / chunk);
 
-    for (size_t off = 0; off < len; off += chunk) {
+    struct os_mbuf **mbs = calloc((size_t)nchunks, sizeof(*mbs));
+    if (mbs == NULL) {
+        ESP_LOGW(TAG, "handle=%u: mbuf-array alloc failed (%d chunks)", h, nchunks);
+        return BLE_HS_ENOMEM;
+    }
+
+    /* Phase 1: allocate every chunk's mbuf (with the usual ENOMEM retry). */
+    int rc = 0;
+    int got = 0;
+    for (int c = 0; c < nchunks; c++) {
+        size_t off = (size_t)c * chunk;
         size_t n = (len - off < chunk) ? (len - off) : chunk;
-
-        int rc = BLE_HS_EAGAIN;
+        struct os_mbuf *om = NULL;
         for (int retry = 0; retry < NUS_MAX_RETRIES; retry++) {
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(data + off, n);
-            if (om == NULL) {
-                vTaskDelay(pdMS_TO_TICKS(NUS_ENOMEM_RETRY_MS));
-                continue;
-            }
-            rc = ble_gatts_notify_custom(h, nus_tx_val_handle, om);
-            if (rc == 0 || rc != BLE_HS_ENOMEM) {
+            om = ble_hs_mbuf_from_flat(data + off, n);
+            if (om != NULL) {
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(NUS_ENOMEM_RETRY_MS));
         }
-
-        if (rc == BLE_HS_ENOTCONN) {
-            ESP_LOGW(TAG, "notify handle=%u gone, dropping peer", h);
-            nus_peer_disconnect(h);  /* idempotent clear + count fix */
-            return BLE_HS_ENOTCONN;
+        if (om == NULL) {
+            rc = BLE_HS_ENOMEM;
+            break;
         }
-        if (rc != 0) {
-            ESP_LOGW(TAG, "notify handle=%u rc=%d", h, rc);
-            return rc;
+        mbs[got++] = om;
+    }
+
+    /* Phase 2: all mbufs ready -> notify each (notify_custom consumes the mbuf
+     * on every return path). Stop on the first hard error. */
+    if (rc == 0) {
+        for (int c = 0; c < nchunks; c++) {
+            int r = ble_gatts_notify_custom(h, nus_tx_val_handle, mbs[c]);
+            mbs[c] = NULL;   /* consumed by the BLE stack (success or failure) */
+            if (r == 0) {
+                continue;
+            }
+            if (r == BLE_HS_ENOTCONN) {
+                ESP_LOGW(TAG, "notify handle=%u gone, dropping peer", h);
+                nus_peer_disconnect(h);  /* idempotent clear + count fix */
+            } else {
+                ESP_LOGW(TAG, "notify handle=%u rc=%d", h, r);
+            }
+            rc = r;
+            break;
+        }
+    } else {
+        ESP_LOGW(TAG, "handle=%u: mbuf alloc exhausted, dropping %u-byte frame "
+                 "(not partially sent)", h, (unsigned)len);
+    }
+
+    /* Free any mbuf we allocated but did NOT hand to notify_custom (allocation
+     * abort, or a notify error that stopped us mid-frame). NULL entries were
+     * already consumed by the stack. */
+    for (int c = 0; c < got; c++) {
+        if (mbs[c] != NULL) {
+            os_mbuf_free_chain(mbs[c]);
         }
     }
-    return 0;
+    free(mbs);
+    return rc;
 }
 
 /* Core send routine with a target selector.

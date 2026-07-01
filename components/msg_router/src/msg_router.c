@@ -235,7 +235,7 @@ esp_err_t msg_submit_from(const msg_origin_t *origin,
         return ESP_ERR_INVALID_ARG;
     }
     if (len > 0xFFFF) {
-        len = 0xFFFF; /* header field is uint16_t */
+        return ESP_ERR_INVALID_SIZE; /* header field is uint16_t */
     }
 
     /* Zero-copy submit into the central buffer. */

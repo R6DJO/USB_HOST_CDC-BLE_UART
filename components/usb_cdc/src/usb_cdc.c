@@ -157,7 +157,7 @@ static void usb_cdc_task(void *arg)
     };
 
     for (;;) {
-        ESP_LOGI(TAG, "Opening CDC ACM device 0x%04X:0x%04X...",
+        ESP_LOGD(TAG, "Opening CDC ACM device 0x%04X:0x%04X...",
                  CONFIG_USB_CDC_DEVICE_VID, CONFIG_USB_CDC_DEVICE_PID);
         /* Open + configure on a LOCAL handle the sink cannot see yet, so
          * line-coding / control-line setup can't race with a disconnect. */
@@ -166,7 +166,7 @@ static void usb_cdc_task(void *arg)
                                           CONFIG_USB_CDC_DEVICE_PID, 0,
                                           &dev_config, &new_dev);
         if (err != ESP_OK) {
-            ESP_LOGI(TAG, "Failed to open device");
+            ESP_LOGD(TAG, "open failed: %s", esp_err_to_name(err));
             vTaskDelay(pdMS_TO_TICKS(CDC_OPEN_RETRY_MS));
             continue;
         }

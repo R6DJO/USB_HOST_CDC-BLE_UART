@@ -25,7 +25,7 @@
 #include "msg_router.h"
 
 /* ---- tasks ---- */
-#define RX_TASK_STACK   4096
+#define RX_TASK_STACK   2048
 #define RX_TASK_PRIO    6
 #define AB_TASK_STACK   4096
 #define AB_TASK_PRIO    4
