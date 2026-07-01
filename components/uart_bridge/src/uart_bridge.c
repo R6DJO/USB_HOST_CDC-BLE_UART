@@ -117,10 +117,23 @@ static void bridge_rx_task(void *arg)
         if (event.type != UART_DATA || event.size == 0) {
             continue;
         }
-        size_t want = event.size > buf_len ? buf_len : event.size;
-        int n = uart_read_bytes(cfg->port, buf, want, portMAX_DELAY);
-        if (n > 0) {
+        /* Drain the whole reported batch, chunked by the scratch buffer. The
+         * UART driver's UART_DATA events are edge-triggered on new wire
+         * traffic: if event.size exceeds buf_len, the unread remainder would
+         * sit in the RX ring buffer until the NEXT byte arrives on the wire
+         * (no event is raised for already-buffered bytes). For a transparent
+         * bridge that delays the tail of every large burst, so read everything
+         * event.size reports right now. Bytes that arrive after this snapshot
+         * get their own event. */
+        size_t remaining = event.size;
+        while (remaining > 0) {
+            size_t want = remaining > buf_len ? buf_len : remaining;
+            int n = uart_read_bytes(cfg->port, buf, want, portMAX_DELAY);
+            if (n <= 0) {
+                break; /* data was guaranteed; stay safe if it vanished */
+            }
             msg_submit(cfg->iface, buf, (size_t)n);
+            remaining -= (size_t)n;
         }
     }
 }
