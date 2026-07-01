@@ -26,9 +26,6 @@ extern "C" {
  */
 esp_err_t uart_radio_init(void);
 
-/** Baud rate currently in use, or 0 until auto-baud succeeds. */
-uint32_t uart_radio_baud(void);
-
 #ifdef __cplusplus
 }
 #endif

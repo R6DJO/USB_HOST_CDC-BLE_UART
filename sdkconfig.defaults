@@ -22,6 +22,9 @@ CONFIG_NORDIC_UART_RX_BUFFER_SIZE=4096
 
 # --- Message router ---
 CONFIG_MSG_ROUTER_BUF_SIZE=8192
+# Per-sink async delivery (variant C): private queue + dedicated task per sink
+CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE=4096
+CONFIG_MSG_ROUTER_SINK_TASK_STACK=3072
 
 # --- UART Bridge (pins/rates; adjust to your board wiring) ---
 # UART Radio: auto-baud probes 9600 then 115200 via 'AT'

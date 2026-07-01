@@ -2,10 +2,22 @@
  * SPDX-License-Identifier: CC0-1.0
  *
  * Central message router implementation.
+ *
+ * Delivery model (variant C -- asynchronous per-sink queues):
+ *   - Producers push frames into one central ring buffer (msg_submit*).
+ *   - The msg_routing task drains it and pushes each frame, NON-blocking and
+ *     drop-on-full, into the PRIVATE queue of every target sink.
+ *   - Each registered sink owns a dedicated delivery task that drains its own
+ *     queue and calls the real delivery function. That function may block
+ *     freely (USB tx, BLE notify, UART write) -- only that one sink is
+ *     affected; the router and every other sink keep running.
+ *
+ * Sink authors see no change: msg_sink_fn_t is still a plain function. The
+ * async isolation is provided transparently by msg_router_register_sink().
  */
 #include "msg_router.h"
 
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -13,22 +25,63 @@
 
 static const char *TAG = "MSG_ROUTER";
 
-/* FreeRTOS task params. */
+/* Central routing (dispatch) task. */
 #define MSG_ROUTER_TASK_STACK  4096
 #define MSG_ROUTER_TASK_PRIO   8
 
-/* How long msg_submit() waits for room in the ring buffer before dropping. */
+/* Per-sink delivery task. Lower than the router so dispatch never starves. */
+#define SINK_TASK_PRIO         5
+
+/* How long msg_submit() waits for room in the central buffer before dropping. */
 #define MSG_SUBMIT_TIMEOUT_MS  20
 
-/** One routed frame. Payload bytes follow the header (flexible array member). */
+/** One routed frame. Payload bytes follow the header (flexible array member).
+ *  Used both by the central buffer and by each per-sink queue. */
 typedef struct {
     msg_origin_t origin;/**< source interface + peer          */
     uint16_t     len;   /**< bytes in data[]                   */
     uint8_t      data[];/**< raw payload, binary-safe          */
 } msg_item_t;
 
+typedef struct {
+    msg_sink_fn_t   deliver;  /**< real delivery fn (may block)   */
+    RingbufHandle_t q;        /**< private per-sink queue         */
+} sink_slot_t;
+
 static RingbufHandle_t s_buf;
-static msg_sink_fn_t   s_sinks[MSG_IF_COUNT];
+static sink_slot_t     s_sinks[MSG_IF_COUNT];
+
+/* Per-sink task names (FreeRTOS caps these at configMAX_TASK_NAME_LEN). */
+static const char *const SINK_TASK_NAMES[MSG_IF_COUNT] = {
+    [MSG_IF_USB_CDC]    = "sink_usb",
+    [MSG_IF_BLE]        = "sink_ble",
+    [MSG_IF_UART_RADIO] = "sink_urad",
+    [MSG_IF_UART_LORA]  = "sink_ulora",
+};
+
+/* ----------------------------------------------------------- sink delivery */
+
+/** Drain one sink's queue and call its delivery function. Runs in its own
+ *  task so the (possibly blocking) delivery cannot stall the router. */
+static void sink_task(void *arg)
+{
+    msg_iface_t   iface    = (msg_iface_t)(intptr_t)arg;
+    msg_sink_fn_t deliver  = s_sinks[iface].deliver;
+    RingbufHandle_t q      = s_sinks[iface].q;
+
+    for (;;) {
+        size_t item_size = 0;
+        const msg_item_t *item = (const msg_item_t *)xRingbufferReceive(
+            q, &item_size, portMAX_DELAY);
+        if (item == NULL) {
+            continue;
+        }
+        deliver(&item->origin, item->data, item->len);
+        vRingbufferReturnItem(q, (void *)item);
+    }
+}
+
+/* --------------------------------------------------------------- lifecycle */
 
 esp_err_t msg_router_init(void)
 {
@@ -48,12 +101,36 @@ esp_err_t msg_router_init(void)
 
 esp_err_t msg_router_register_sink(msg_iface_t dest, msg_sink_fn_t fn)
 {
-    if (dest >= MSG_IF_COUNT) {
+    if (dest >= MSG_IF_COUNT || fn == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    s_sinks[dest] = fn;
+    if (s_sinks[dest].deliver != NULL) {
+        return ESP_ERR_INVALID_STATE; /* already registered */
+    }
+
+    s_sinks[dest].q = xRingbufferCreate(CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE,
+                                        RINGBUF_TYPE_NOSPLIT);
+    if (s_sinks[dest].q == NULL) {
+        ESP_LOGE(TAG, "Failed to create sink queue if=%d (%d bytes)",
+                 dest, CONFIG_MSG_ROUTER_SINK_QUEUE_SIZE);
+        return ESP_ERR_NO_MEM;
+    }
+    s_sinks[dest].deliver = fn;
+
+    BaseType_t ok = xTaskCreate(sink_task, SINK_TASK_NAMES[dest],
+                                CONFIG_MSG_ROUTER_SINK_TASK_STACK,
+                                (void *)(intptr_t)dest, SINK_TASK_PRIO, NULL);
+    if (ok != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create sink task if=%d", dest);
+        vRingbufferDelete(s_sinks[dest].q);
+        s_sinks[dest].q = NULL;
+        s_sinks[dest].deliver = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }
+
+/* --------------------------------------------------------------- submit */
 
 esp_err_t msg_submit_from(const msg_origin_t *origin,
                           const uint8_t *data, size_t len)
@@ -66,25 +143,19 @@ esp_err_t msg_submit_from(const msg_origin_t *origin,
         len = 0xFFFF; /* header field is uint16_t */
     }
 
+    /* Zero-copy submit into the central buffer. */
     size_t item_size = sizeof(msg_item_t) + len;
-    msg_item_t *item = malloc(item_size);
-    if (item == NULL) {
-        ESP_LOGE(TAG, "submit malloc fail (%u bytes from if=%d)",
-                 (unsigned)item_size, origin->iface);
+    msg_item_t *item;
+    if (xRingbufferSendAcquire(s_buf, (void **)&item, item_size,
+                               pdMS_TO_TICKS(MSG_SUBMIT_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Router buffer full, dropping %u byte(s) from if=%d",
+                 (unsigned)len, origin->iface);
         return ESP_ERR_NO_MEM;
     }
     item->origin = *origin;
     item->len = (uint16_t)len;
     memcpy(item->data, data, len);
-
-    if (xRingbufferSend(s_buf, item, item_size,
-                        pdMS_TO_TICKS(MSG_SUBMIT_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGW(TAG, "Router buffer full, dropping %u byte(s) from if=%d",
-                 (unsigned)len, origin->iface);
-        free(item);
-        return ESP_ERR_NO_MEM;
-    }
-    free(item); /* xRingbufferSend copied the contents */
+    xRingbufferSendComplete(s_buf, item);
     return ESP_OK;
 }
 
@@ -94,20 +165,44 @@ esp_err_t msg_submit(msg_iface_t src, const uint8_t *data, size_t len)
     return msg_submit_from(&origin, data, len);
 }
 
-/* --------------------------------------------------------------- routing */
+/* --------------------------------------------------------------- dispatch */
+
+/** Push one frame into a sink's private queue (non-blocking, drop-on-full).
+ *  Keeping this non-blocking is what guarantees a slow sink cannot stall the
+ *  routing task or any other sink. */
+static void sink_enqueue(msg_iface_t dest, const msg_origin_t *origin,
+                         const uint8_t *data, size_t len)
+{
+    RingbufHandle_t q = s_sinks[dest].q;
+    if (q == NULL) {
+        return; /* no sink registered for this destination */
+    }
+
+    size_t item_size = sizeof(msg_item_t) + len;
+    msg_item_t *item;
+    if (xRingbufferSendAcquire(q, (void **)&item, item_size, 0) != pdTRUE) {
+        /* Queue full: drop the newest frame for THIS sink only. */
+        ESP_LOGW(TAG, "sink if=%d queue full, dropping %u byte(s)",
+                 dest, (unsigned)len);
+        return;
+    }
+    item->origin = *origin;
+    item->len = (uint16_t)len;
+    memcpy(item->data, data, len);
+    xRingbufferSendComplete(q, item);
+}
 
 /**
- * Default delivery: hand the frame to EVERY registered sink. Each sink is
- * responsible for not echoing it back to its own originator (single-port
- * interfaces skip their own interface; BLE skips only the sender peer). This
- * keeps the router generic while still enforcing "no loop-back".
+ * Default delivery: enqueue the frame into EVERY registered sink's queue.
+ * Each sink still self-excludes its own originator inside its delivery fn
+ * (single-port interfaces skip their own iface; BLE skips only the sender).
  */
 static void deliver_to_all(const msg_origin_t *origin,
                            const uint8_t *data, size_t len)
 {
     for (int d = 0; d < MSG_IF_COUNT; d++) {
-        if (s_sinks[d]) {
-            s_sinks[d](origin, data, len);
+        if (s_sinks[d].deliver) {
+            sink_enqueue((msg_iface_t)d, origin, data, len);
         }
     }
 }
@@ -115,57 +210,38 @@ static void deliver_to_all(const msg_origin_t *origin,
 void msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,
                         const uint8_t *data, size_t len)
 {
-    if (dest < MSG_IF_COUNT && s_sinks[dest]) {
-        s_sinks[dest](origin, data, len);
+    if (dest < MSG_IF_COUNT && s_sinks[dest].deliver) {
+        sink_enqueue(dest, origin, data, len);
     }
 }
+
+/* --------------------------------------------------------------- routing */
 
 /**
  * Per-source routing policy.
  *
- * Default behaviour: deliver to all interfaces (sinks self-exclude the
- * originator). To restrict a source to a specific set of destinations, edit
- * the matching case and forward explicitly with msg_router_send_to(), e.g.:
+ * Default: enqueue into every sink. To restrict a source to specific
+ * destinations, switch over origin->iface and forward explicitly with
+ * msg_router_send_to(), e.g.:
  *
- *     case MSG_IF_UART_LORA:
- *         // Lora -> BLE only
+ *     switch (origin->iface) {
+ *     case MSG_IF_UART_LORA:            // Lora -> BLE only
  *         msg_router_send_to(MSG_IF_BLE, origin, data, len);
  *         break;
- *
- * To completely suppress BLE peer fan-out (so BLE clients are isolated from
- * each other), simply don't call the BLE sink from the MSG_IF_BLE case, e.g.:
- *
- *     case MSG_IF_BLE:
- *         msg_router_send_to(MSG_IF_USB_CDC,    origin, data, len);
- *         msg_router_send_to(MSG_IF_UART_RADIO, origin, data, len);
- *         msg_router_send_to(MSG_IF_UART_LORA,  origin, data, len);
+ *     default:
+ *         deliver_to_all(origin, data, len);
  *         break;
+ *     }
+ *
+ * Both paths go through the per-sink queues, so they never block.
+ *
+ * Frames with an out-of-range iface never reach here: msg_submit_from()
+ * rejects them before they enter the central buffer.
  */
 static void route_message(const msg_origin_t *origin,
                           const uint8_t *data, size_t len)
 {
-    switch (origin->iface) {
-    case MSG_IF_USB_CDC:
-        deliver_to_all(origin, data, len);
-        break;
-
-    case MSG_IF_BLE:
-        deliver_to_all(origin, data, len);
-        break;
-
-    case MSG_IF_UART_RADIO:
-        deliver_to_all(origin, data, len);
-        break;
-
-    case MSG_IF_UART_LORA:
-        deliver_to_all(origin, data, len);
-        break;
-
-    default:
-        ESP_LOGW(TAG, "Unknown source if=%d, dropping %u byte(s)",
-                 origin->iface, (unsigned)len);
-        break;
-    }
+    deliver_to_all(origin, data, len);
 }
 
 void msg_routing_task(void *arg)
@@ -182,6 +258,8 @@ void msg_routing_task(void *arg)
 
         ESP_LOGD(TAG, "route if=%d peer=%u -> %u byte(s)",
                  item->origin.iface, item->origin.peer, item->len);
+        /* Dispatch is non-blocking: each sink gets its own copy in its queue,
+         * so we can return the central-buffer item immediately. */
         route_message(&item->origin, item->data, item->len);
 
         vRingbufferReturnItem(s_buf, (void *)item);

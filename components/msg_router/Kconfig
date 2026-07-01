@@ -8,4 +8,22 @@ menu "Message Router"
             Size of the FreeRTOS ring buffer that queues frames between all
             interfaces. Holds a small header plus the payload per frame.
 
+    config MSG_ROUTER_SINK_QUEUE_SIZE
+        int "Per-sink delivery queue size (bytes)"
+        default 4096
+        range 256 16384
+        help
+            Each registered sink gets its own ring buffer of this size. The
+            routing task pushes frames into it non-blocking; when a sink is
+            slow and its queue fills, new frames to THAT sink are dropped
+            (drop-newest) so other sinks and producers are never blocked.
+
+    config MSG_ROUTER_SINK_TASK_STACK
+        int "Per-sink delivery task stack (bytes)"
+        default 3072
+        range 1024 8192
+        help
+            Stack for each sink's dedicated delivery task (one task per
+            registered sink).
+
 endmenu

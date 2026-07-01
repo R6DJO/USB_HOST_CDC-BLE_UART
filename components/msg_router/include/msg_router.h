@@ -5,9 +5,12 @@
  *
  * Every interface in the system (USB CDC, BLE, UART Radio, UART Lora, ...)
  * is both a *source* and a *destination* of data. Producers push received
- * frames into the router with msg_submit() / msg_submit_from(); a single
- * msg_routing task drains the queue and forwards each frame to every
- * registered sink.
+ * frames with msg_submit() / msg_submit_from() into a central queue. The
+ * msg_routing task drains it and pushes each frame (non-blocking,
+ * drop-on-full) into the PRIVATE queue of every target sink. Each sink owns a
+ * dedicated delivery task that drains its queue and calls the real delivery
+ * function -- which may block (USB tx, BLE notify, UART write) without
+ * stalling the router or any other sink.
  *
  * Self-exclusion: a sink must NOT echo a frame back to its own originator.
  *  - Single-port interfaces (USB, UART Radio, UART Lora) just return when the
@@ -71,10 +74,13 @@ typedef void (*msg_sink_fn_t)(const msg_origin_t *origin,
 esp_err_t msg_router_init(void);
 
 /**
- * Register (or replace) the sink callback for a destination interface.
- * A destination with no registered sink is simply skipped while routing.
+ * Register the sink callback for a destination interface. This creates the
+ * sink's private queue and spawns its delivery task, so call it before
+ * msg_router_start() and at most once per destination. A destination with no
+ * registered sink is simply skipped while routing.
  *
- * @return ESP_OK or ESP_ERR_INVALID_ARG.
+ * @return ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE if already
+ *         registered, or ESP_ERR_NO_MEM if the queue/task could not be created.
  */
 esp_err_t msg_router_register_sink(msg_iface_t dest, msg_sink_fn_t fn);
 
@@ -106,8 +112,8 @@ void msg_router_send_to(msg_iface_t dest, const msg_origin_t *origin,
                         const uint8_t *data, size_t len);
 
 /**
- * Create the msg_routing task. All sinks should be registered beforehand
- * (sinks may still be registered later / changed at runtime).
+ * Create the msg_routing task. All sinks must be registered beforehand via
+ * msg_router_register_sink().
  *
  * @return ESP_OK or ESP_FAIL if the task could not be created.
  */

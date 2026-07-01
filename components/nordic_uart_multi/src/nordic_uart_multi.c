@@ -61,6 +61,20 @@ static uint8_t    nus_conn_count;
 
 RingbufHandle_t nordic_uart_rx_buf_handle;
 
+/* nus_peers[] and nus_conn_count are touched from TWO tasks concurrently:
+ *   - the NimBLE host task (nus_gap_event: connect/disconnect/subscribe/mtu),
+ *   - the message-routing task (nus_send_common -> nus_peer_send -> notify).
+ * Guard every access with a spinlock. Critical sections are tiny and contain
+ * NO blocking calls (no notify, no advertise, no logging inside the lock). */
+static portMUX_TYPE nus_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* A peer selected for a notify, snapshotted under nus_lock so the slow
+ * ble_gatts_notify_custom() call runs lock-free. */
+typedef struct {
+    uint16_t h;
+    uint16_t mtu;
+} nus_target_t;
+
 /* ------------------------------------------------------------------ helpers */
 
 static inline bool nus_handle_ok(uint16_t h)
@@ -68,9 +82,57 @@ static inline bool nus_handle_ok(uint16_t h)
     return h < NUS_PEER_ARRAY_SIZE;
 }
 
-static uint16_t nus_peer_mtu(uint16_t h)
+/* --- locked accessors (each briefly takes nus_lock; non-blocking) -------- */
+
+static uint8_t nus_conn_count_get(void)
 {
-    return nus_peers[h].mtu ? nus_peers[h].mtu : NUS_DEFAULT_MTU;
+    uint8_t c;
+    portENTER_CRITICAL(&nus_lock);
+    c = nus_conn_count;
+    portEXIT_CRITICAL(&nus_lock);
+    return c;
+}
+
+/* Mark a peer freshly connected and bump the connection count. */
+static void nus_peer_connect(uint16_t h)
+{
+    portENTER_CRITICAL(&nus_lock);
+    memset(&nus_peers[h], 0, sizeof(nus_peer_t));
+    nus_peers[h].connected = true;
+    nus_conn_count++;
+    portEXIT_CRITICAL(&nus_lock);
+}
+
+/* Clear a peer slot if it is still connected, fixing the connection count.
+ * Returns true if the slot actually transitioned connected -> free.
+ * Idempotent: safe to call after the BLE_GAP_EVENT_DISCONNECT has run. */
+static bool nus_peer_disconnect(uint16_t h)
+{
+    bool changed = false;
+    portENTER_CRITICAL(&nus_lock);
+    if (nus_handle_ok(h) && nus_peers[h].connected) {
+        memset(&nus_peers[h], 0, sizeof(nus_peer_t));
+        if (nus_conn_count > 0) {
+            nus_conn_count--;
+        }
+        changed = true;
+    }
+    portEXIT_CRITICAL(&nus_lock);
+    return changed;
+}
+
+static void nus_peer_set_subscribed(uint16_t h, bool v)
+{
+    portENTER_CRITICAL(&nus_lock);
+    nus_peers[h].subscribed = v;
+    portEXIT_CRITICAL(&nus_lock);
+}
+
+static void nus_peer_set_mtu(uint16_t h, uint16_t v)
+{
+    portENTER_CRITICAL(&nus_lock);
+    nus_peers[h].mtu = v;
+    portEXIT_CRITICAL(&nus_lock);
 }
 
 /* ----------------------------------------------------------- GAP advertising */
@@ -79,7 +141,7 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg);
 
 static void nus_advertise(void)
 {
-    if (nus_conn_count >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+    if (nus_conn_count_get() >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
         return; /* at capacity: cannot accept more peers */
     }
     if (ble_gap_adv_active()) {
@@ -95,14 +157,9 @@ static void nus_advertise(void)
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
-    /* Short name keeps the 31-byte adv payload valid alongside the
-     * 16-byte 128-bit service UUID. Full name goes into scan response. */
-    char short_name[6]; /* 5 chars + NUL */
-    strncpy(short_name, name, sizeof(short_name));
-    short_name[sizeof(short_name) - 1] = '\0';
-    fields.name = (uint8_t *)short_name;
-    fields.name_len = strlen(short_name);
-    fields.name_is_complete = (name_len <= sizeof(short_name) - 1) ? 1 : 0;
+    /* Advertising payload carries only flags + tx power + the 128-bit service
+     * UUID (what NUS clients filter on). The full device name is published in
+     * the scan response below — no truncated short name in the primary packet. */
 
     fields.uuids128 = &NUS_SVC_UUID;
     fields.num_uuids128 = 1;
@@ -147,14 +204,13 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             uint16_t h = event->connect.conn_handle;
-            nus_conn_count++;
             if (nus_handle_ok(h)) {
-                memset(&nus_peers[h], 0, sizeof(nus_peer_t));
-                nus_peers[h].connected = true;
+                nus_peer_connect(h);
             }
+            uint8_t total = nus_conn_count_get();
             ESP_LOGI(TAG, "Connected handle=%u  total=%u/%u",
-                     h, nus_conn_count, CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
-            if (nus_conn_count < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+                     h, total, CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
+            if (total < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
                 nus_advertise(); /* keep accepting more peers */
             }
         } else {
@@ -165,15 +221,11 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT: {
         uint16_t h = event->disconnect.conn.conn_handle;
-        if (nus_handle_ok(h)) {
-            memset(&nus_peers[h], 0, sizeof(nus_peer_t));
-        }
-        if (nus_conn_count > 0) {
-            nus_conn_count--;
-        }
+        nus_peer_disconnect(h);            /* idempotent: clears slot + count */
+        uint8_t total = nus_conn_count_get();
         ESP_LOGI(TAG, "Disconnected handle=%u reason=%d  total=%u/%u",
                  h, event->disconnect.reason,
-                 nus_conn_count, CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
+                 total, CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
         nus_advertise(); /* a slot freed up */
         return 0;
     }
@@ -182,7 +234,7 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
         uint16_t h = event->subscribe.conn_handle;
         if (nus_handle_ok(h) &&
             event->subscribe.attr_handle == nus_tx_val_handle) {
-            nus_peers[h].subscribed = event->subscribe.cur_notify ? true : false;
+            nus_peer_set_subscribed(h, event->subscribe.cur_notify);
             ESP_LOGI(TAG, "Subscribe handle=%u notify=%d", h,
                      event->subscribe.cur_notify);
         }
@@ -192,7 +244,7 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU: {
         uint16_t h = event->mtu.conn_handle;
         if (nus_handle_ok(h)) {
-            nus_peers[h].mtu = event->mtu.value;
+            nus_peer_set_mtu(h, event->mtu.value);
         }
         ESP_LOGD(TAG, "MTU handle=%u mtu=%u", h, event->mtu.value);
         return 0;
@@ -227,25 +279,27 @@ static int nus_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             return 0;
         }
 
+        /* Zero-copy: acquire storage inside the RX ring buffer and copy the
+         * mbuf straight into it (no malloc / memcpy / free per write). */
         size_t item_size = sizeof(nordic_uart_rx_item_t) + len;
-        nordic_uart_rx_item_t *item = malloc(item_size);
-        if (item == NULL) {
-            ESP_LOGE(TAG, "RX malloc fail len=%u", len);
-            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        nordic_uart_rx_item_t *item;
+        if (xRingbufferSendAcquire(nordic_uart_rx_buf_handle, (void **)&item,
+                                   item_size,
+                                   pdMS_TO_TICKS(NUS_NOTIFY_TIMEOUT)) != pdTRUE) {
+            ESP_LOGW(TAG, "RX ring buffer full, dropping %u bytes from handle %u",
+                     len, conn_handle);
+            return 0;
         }
         item->conn_handle = conn_handle;
         item->len = len;
         if (os_mbuf_copydata(ctxt->om, 0, len, item->data) != 0) {
-            free(item);
-            return BLE_ATT_ERR_UNLIKELY;
+            /* Should not happen (len == PKTLEN). Publish an empty item so the
+             * consumer drops it, and never leave an acquired slot uncompleted
+             * (that would stall the whole ring buffer). */
+            ESP_LOGE(TAG, "RX mbuf copydata failed len=%u", len);
+            item->len = 0;
         }
-
-        if (xRingbufferSend(nordic_uart_rx_buf_handle, item, item_size,
-                            pdMS_TO_TICKS(NUS_NOTIFY_TIMEOUT)) != pdTRUE) {
-            ESP_LOGW(TAG, "RX ring buffer full, dropping %u bytes from handle %u",
-                     len, conn_handle);
-        }
-        free(item); /* xRingbufferSend copied the contents */
+        xRingbufferSendComplete(nordic_uart_rx_buf_handle, item);
         return 0;
     }
 
@@ -285,9 +339,9 @@ typedef enum {
 /* Send one chunked notification to a single peer.
  * Returns 0 on success, or a BLE_HS_* error code. On BLE_HS_ENOTCONN the
  * peer is dropped (it has gone away). */
-static int nus_peer_send(uint16_t h, const uint8_t *data, size_t len)
+static int nus_peer_send(uint16_t h, uint16_t mtu, const uint8_t *data, size_t len)
 {
-    size_t chunk = nus_peer_mtu(h) - 3; /* 3 bytes ATT header overhead */
+    size_t chunk = (mtu ? mtu : NUS_DEFAULT_MTU) - 3; /* 3 bytes ATT header */
 
     for (size_t off = 0; off < len; off += chunk) {
         size_t n = (len - off < chunk) ? (len - off) : chunk;
@@ -308,10 +362,7 @@ static int nus_peer_send(uint16_t h, const uint8_t *data, size_t len)
 
         if (rc == BLE_HS_ENOTCONN) {
             ESP_LOGW(TAG, "notify handle=%u gone, dropping peer", h);
-            memset(&nus_peers[h], 0, sizeof(nus_peer_t));
-            if (nus_conn_count > 0) {
-                nus_conn_count--;
-            }
+            nus_peer_disconnect(h);  /* idempotent clear + count fix */
             return BLE_HS_ENOTCONN;
         }
         if (rc != 0) {
@@ -339,16 +390,26 @@ static esp_err_t nus_send_common(const uint8_t *data, size_t len,
     }
 
     if (mode == NUS_SEND_ONE) {
-        if (!nus_handle_ok(target) || !nus_peers[target].connected) {
+        bool connected, subscribed;
+        portENTER_CRITICAL(&nus_lock);
+        connected  = nus_handle_ok(target) && nus_peers[target].connected;
+        subscribed = connected && nus_peers[target].subscribed;
+        portEXIT_CRITICAL(&nus_lock);
+        if (!connected) {
             ESP_LOGW(TAG, "send_to handle=%u not connected", target);
             return ESP_ERR_NOT_FOUND;
         }
-        if (!nus_peers[target].subscribed) {
+        if (!subscribed) {
             ESP_LOGW(TAG, "send_to handle=%u not subscribed", target);
             return ESP_ERR_INVALID_STATE;
         }
     }
 
+    /* Snapshot the target set under the lock, then notify lock-free: the
+     * notify call (and its retry loop) is slow and must not hold nus_lock. */
+    nus_target_t targets[NUS_PEER_ARRAY_SIZE];
+    size_t n = 0;
+    portENTER_CRITICAL(&nus_lock);
     for (uint16_t h = 0; h < NUS_PEER_ARRAY_SIZE; h++) {
         if (!nus_peers[h].connected || !nus_peers[h].subscribed) {
             continue;
@@ -359,7 +420,14 @@ static esp_err_t nus_send_common(const uint8_t *data, size_t len,
         if (mode == NUS_SEND_ALL_EXCEPT && h == target) {
             continue;
         }
-        nus_peer_send(h, data, len);
+        targets[n].h   = h;
+        targets[n].mtu = nus_peers[h].mtu ? nus_peers[h].mtu : NUS_DEFAULT_MTU;
+        n++;
+    }
+    portEXIT_CRITICAL(&nus_lock);
+
+    for (size_t i = 0; i < n; i++) {
+        nus_peer_send(targets[i].h, targets[i].mtu, data, len);
     }
 
     return ESP_OK;
@@ -406,17 +474,19 @@ esp_err_t nordic_uart_send_str_except(uint16_t conn_handle, const char *str)
 
 uint8_t nordic_uart_client_count(void)
 {
-    return nus_conn_count;
+    return nus_conn_count_get();
 }
 
 uint8_t nordic_uart_subscribed_count(void)
 {
     uint8_t c = 0;
+    portENTER_CRITICAL(&nus_lock);
     for (uint16_t h = 0; h < NUS_PEER_ARRAY_SIZE; h++) {
         if (nus_peers[h].connected && nus_peers[h].subscribed) {
             c++;
         }
     }
+    portEXIT_CRITICAL(&nus_lock);
     return c;
 }
 
@@ -500,7 +570,9 @@ esp_err_t nordic_uart_stop(void)
         vRingbufferDelete(nordic_uart_rx_buf_handle);
         nordic_uart_rx_buf_handle = NULL;
     }
+    portENTER_CRITICAL(&nus_lock);
     nus_conn_count = 0;
     memset(nus_peers, 0, sizeof nus_peers);
+    portEXIT_CRITICAL(&nus_lock);
     return ESP_OK;
 }

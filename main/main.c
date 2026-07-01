@@ -194,7 +194,7 @@ void app_main(void)
 
     /* --- BLE Nordic UART peripheral -------------------------------------- */
     nordic_uart_start("DMR-RADIO");
-    BaseType_t task_created = xTaskCreate(ble_to_router_task, "ble2rt", 5000,
+    BaseType_t task_created = xTaskCreate(ble_to_router_task, "ble2rt", 2048,
                                           NULL, 1, NULL);
     assert(task_created == pdTRUE);
 
@@ -236,14 +236,15 @@ void app_main(void)
         }
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        /* Configure line coding: 115200 8N1 */
-        cdc_acm_line_coding_t line_coding;
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(cdc_dev, &line_coding));
-
-        line_coding.dwDTERate = 115200;
-        line_coding.bDataBits = 8;
-        line_coding.bParityType = 0;
-        line_coding.bCharFormat = 1;
+        /* Configure line coding: 115200 8N1.
+         * One SET, then a GET only to log the values actually applied by the
+         * device (some CDC devices clamp/ignore requested settings). */
+        cdc_acm_line_coding_t line_coding = {
+            .dwDTERate   = 115200,
+            .bDataBits   = 8,
+            .bParityType = 0,
+            .bCharFormat = 1,
+        };
         ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(cdc_dev, &line_coding));
 
         ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(cdc_dev, &line_coding));
