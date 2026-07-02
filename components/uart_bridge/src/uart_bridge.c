@@ -164,7 +164,10 @@ static bool at_exchange_ok(uart_bridge_t *b, const char *cmd, size_t cmd_len,
 {
     const uart_bridge_cfg_t *cfg = b->cfg;
     uart_flush_input(cfg->port);
-    while (xQueueReceive(b->evt_queue, NULL, 0)) { }
+    {
+        uart_event_t ev;
+        while (xQueueReceive(b->evt_queue, &ev, 0));
+    }
 
     uart_write_bytes(cfg->port, cmd, cmd_len);
     uart_wait_tx_done(cfg->port, pdMS_TO_TICKS(100));
@@ -231,7 +234,10 @@ static void bridge_autobaud_task(void *arg)
             if (at_exchange_ok(b, AT_INIT_CMD, sizeof(AT_INIT_CMD) - 1,
                                scratch, scratch_len)) {
                 uart_flush_input(cfg->port);
-                while (xQueueReceive(b->evt_queue, NULL, 0)) { }
+                {
+                    uart_event_t ev;
+                    while (xQueueReceive(b->evt_queue, &ev, 0));
+                }
                 ESP_LOGI(cfg->tag, "Initialized @ %lu bps, bridge active",
                          (unsigned long)b->baud);
                 /* RX task starts only now, after probing+init are done and the
