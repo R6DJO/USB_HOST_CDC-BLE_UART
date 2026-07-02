@@ -33,6 +33,12 @@ static const char *TAG = "BLE_BRIDGE";
  *  - Otherwise broadcast to all peers (e.g. a radio reply). */
 static void ble_sink(const msg_origin_t *origin, const uint8_t *data, size_t len)
 {
+    uint8_t subs = nordic_uart_subscribed_count();
+    uint8_t total = nordic_uart_client_count();
+    ESP_LOGI(TAG, "ble_sink: from if=%d peer=%u len=%u  clients=%u subscribed=%u",
+             origin->iface, origin->peer, (unsigned)len, total, subs);
+    nordic_uart_dump_peers();
+
     esp_err_t err;
     if (origin->iface == MSG_IF_BLE && origin->peer != MSG_PEER_NONE) {
         err = nordic_uart_send_except(origin->peer, data, len);

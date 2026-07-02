@@ -99,6 +99,11 @@ uint8_t nordic_uart_client_count(void);
 /** Number of peers currently subscribed to TX notifications. */
 uint8_t nordic_uart_subscribed_count(void);
 
+/** Dump the full per-peer connection/subscription table to the log (INFO).
+ *  Diagnostic: shows conn/subscribed/mtu for every peer slot so you can spot
+ *  tracking desync (a peer that is BLE-connected but not registered). */
+void nordic_uart_dump_peers(void);
+
 #ifdef __cplusplus
 }
 #endif

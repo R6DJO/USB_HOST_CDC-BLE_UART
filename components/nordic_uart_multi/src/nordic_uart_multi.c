@@ -137,6 +137,26 @@ static void nus_peer_set_mtu(uint16_t h, uint16_t v)
     portEXIT_CRITICAL(&nus_lock);
 }
 
+/* Safety net: if we receive a subscribe / MTU / write event for a handle that
+ * we never registered, the BLE link is provably up even though the connect
+ * event reported a non-zero status (e.g. BLE_HS_EENCRYPT_KEY_SZ = 26, which
+ * NimBLE returns for an encryption key-size mismatch but leaves the link up).
+ * Register the peer now so it is tracked, counted, and eligible for notify. */
+static void nus_peer_ensure_connected(uint16_t h)
+{
+    bool need_register = false;
+    portENTER_CRITICAL(&nus_lock);
+    if (nus_handle_ok(h) && !nus_peers[h].connected) {
+        need_register = true;
+    }
+    portEXIT_CRITICAL(&nus_lock);
+    if (need_register) {
+        ESP_LOGW(TAG, "handle=%u active but unregistered (connect reported "
+                 "failure?) - registering now", h);
+        nus_peer_connect(h);
+    }
+}
+
 /* ----------------------------------------------------------- GAP advertising */
 
 static int nus_gap_event(struct ble_gap_event *event, void *arg);
@@ -219,7 +239,9 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
                 nus_advertise(); /* keep accepting more peers */
             }
         } else {
-            ESP_LOGW(TAG, "Connect failed status=%d", event->connect.status);
+            ESP_LOGW(TAG, "Connect failed status=%d (26=ENCRYPT_KEY_SZ; the "
+                     "link may still be up and registered on first event)",
+                     event->connect.status);
             nus_advertise();
         }
         return 0;
@@ -237,18 +259,50 @@ static int nus_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_SUBSCRIBE: {
         uint16_t h = event->subscribe.conn_handle;
-        if (nus_handle_ok(h) &&
-            event->subscribe.attr_handle == nus_tx_val_handle) {
-            nus_peer_set_subscribed(h, event->subscribe.cur_notify);
-            ESP_LOGI(TAG, "Subscribe handle=%u notify=%d", h,
-                     event->subscribe.cur_notify);
+        uint16_t attr_h = event->subscribe.attr_handle;
+        uint8_t  reason = event->subscribe.reason;
+
+        ESP_LOGI(TAG, "Subscribe: handle=%u attr=0x%04x tx_val=0x%04x "
+                 "reason=%u prev_notify=%d cur_notify=%d "
+                 "prev_indicate=%d cur_indicate=%d",
+                 h, attr_h, nus_tx_val_handle,
+                 reason,
+                 event->subscribe.prev_notify,
+                 event->subscribe.cur_notify,
+                 event->subscribe.prev_indicate,
+                 event->subscribe.cur_indicate);
+
+        if (!nus_handle_ok(h)) {
+            ESP_LOGW(TAG, "Subscribe: handle=%u out of range (max=%u)",
+                     h, NUS_PEER_ARRAY_SIZE - 1);
+            return 0;
         }
+
+        /* Any subscribe event proves the connection is live — register the
+         * peer even if the connect event reported a non-zero status. */
+        nus_peer_ensure_connected(h);
+
+        if (attr_h != nus_tx_val_handle) {
+            ESP_LOGW(TAG, "Subscribe: handle=%u attr=0x%04x != tx_val=0x%04x, ignored",
+                     h, attr_h, nus_tx_val_handle);
+            return 0;
+        }
+
+        nus_peer_set_subscribed(h, event->subscribe.cur_notify);
+
+        if (reason == BLE_GAP_SUBSCRIBE_REASON_TERM) {
+            ESP_LOGI(TAG, "Subscribe: handle=%u cleared (connection terminated)", h);
+        } else if (reason == BLE_GAP_SUBSCRIBE_REASON_RESTORE) {
+            ESP_LOGI(TAG, "Subscribe: handle=%u restored from bonding", h);
+        }
+
         return 0;
     }
 
     case BLE_GAP_EVENT_MTU: {
         uint16_t h = event->mtu.conn_handle;
         if (nus_handle_ok(h)) {
+            nus_peer_ensure_connected(h);
             nus_peer_set_mtu(h, event->mtu.value);
         }
         ESP_LOGD(TAG, "MTU handle=%u mtu=%u", h, event->mtu.value);
@@ -285,6 +339,11 @@ static int nus_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (ble_uuid_cmp(ctxt->chr->uuid, &NUS_RX_UUID.u) == 0) {
         uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
         ESP_LOGI(TAG, "RX write conn=%u len=%u", conn_handle, len);
+
+        /* A write proves the connection is live — register if we missed the
+         * connect event (non-zero connect status). */
+        nus_peer_ensure_connected(conn_handle);
+
         if (len == 0) {
             return 0;
         }
@@ -402,6 +461,7 @@ static int nus_peer_send(uint16_t h, uint16_t mtu, const uint8_t *data, size_t l
             int r = ble_gatts_notify_custom(h, nus_tx_val_handle, mbs[c]);
             mbs[c] = NULL;   /* consumed by the BLE stack (success or failure) */
             if (r == 0) {
+                ESP_LOGI(TAG, "notify OK handle=%u chunk=%d/%d", h, c + 1, nchunks);
                 continue;
             }
             if (r == BLE_HS_ENOTCONN) {
@@ -483,6 +543,8 @@ static esp_err_t nus_send_common(const uint8_t *data, size_t len,
     }
     portEXIT_CRITICAL(&nus_lock);
 
+    ESP_LOGI(TAG, "send_common: mode=%d target=%u data_len=%u targets=%u",
+             (int)mode, target, (unsigned)len, (unsigned)n);
     for (size_t i = 0; i < n; i++) {
         nus_peer_send(targets[i].h, targets[i].mtu, data, len);
     }
@@ -545,6 +607,23 @@ uint8_t nordic_uart_subscribed_count(void)
     }
     portEXIT_CRITICAL(&nus_lock);
     return c;
+}
+
+void nordic_uart_dump_peers(void)
+{
+    /* Snapshot the whole table under the lock, log lock-free. */
+    nus_peer_t snap[NUS_PEER_ARRAY_SIZE];
+    portENTER_CRITICAL(&nus_lock);
+    memcpy(snap, nus_peers, sizeof snap);
+    portEXIT_CRITICAL(&nus_lock);
+
+    for (uint16_t h = 0; h < NUS_PEER_ARRAY_SIZE; h++) {
+        if (!snap[h].connected) {
+            continue;
+        }
+        ESP_LOGI(TAG, "  peer[%u]: conn=%d subscribed=%d mtu=%u",
+                 h, snap[h].connected, snap[h].subscribed, snap[h].mtu);
+    }
 }
 
 /* --------------------------------------------------------------- lifecycle */
