@@ -284,6 +284,7 @@ static int nus_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     /* RX characteristic: peer wrote data to us -> push framed item to ring buf */
     if (ble_uuid_cmp(ctxt->chr->uuid, &NUS_RX_UUID.u) == 0) {
         uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        ESP_LOGI(TAG, "RX write conn=%u len=%u", conn_handle, len);
         if (len == 0) {
             return 0;
         }

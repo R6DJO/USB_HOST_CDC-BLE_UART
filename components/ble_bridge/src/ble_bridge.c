@@ -66,7 +66,7 @@ static void ble_to_router_task(void *arg)
             continue;
         }
 
-        ESP_LOGD(TAG, "peer=%u -> %u byte(s)", item->conn_handle, item->len);
+        ESP_LOGI(TAG, "peer=%u -> %u byte(s)", item->conn_handle, item->len);
         msg_origin_t origin = { .iface = MSG_IF_BLE, .peer = item->conn_handle };
         msg_submit_from(&origin, item->data, item->len);
 
