@@ -597,9 +597,15 @@ esp_err_t nordic_uart_start(const char *device_name)
 
     ESP_ERROR_CHECK(nimble_port_init());
 
-    ble_svc_gap_device_name_set(device_name);
+    /* Order matters: ble_svc_gap_init() must run BEFORE
+     * ble_svc_gap_device_name_set(). With CONFIG_BT_NIMBLE_STATIC_TO_DYNAMIC=y
+     * (the ESP-IDF default), ble_svc_gap_init() -> ble_svc_gap_init_name()
+     * re-initializes the GAP device name to MYNEWT_VAL(BLE_SVC_GAP_DEVICE_NAME)
+     * ("nimble"), discarding -- and leaking -- any name set earlier. Calling
+     * set() after init() reliably overrides that default with ours. */
     ble_svc_gap_init();
     ble_svc_gatt_init();
+    ble_svc_gap_device_name_set(device_name);
 
     int rc = ble_gatts_count_cfg(nus_svcs);
     if (rc != 0) {
