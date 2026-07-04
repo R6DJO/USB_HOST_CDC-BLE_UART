@@ -58,14 +58,14 @@ menu "UART Bridge"
 
         config UART_LORA_TX_GPIO
             int "TX GPIO"
-            default 21
+            default 6
             range 0 48
             help
                 GPIO connected to the Lora module's RX line.
 
         config UART_LORA_RX_GPIO
             int "RX GPIO"
-            default 47
+            default 7
             range 0 48
             help
                 GPIO connected to the Lora module's TX line.

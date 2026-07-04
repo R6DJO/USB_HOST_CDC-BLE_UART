@@ -47,5 +47,14 @@ void app_main(void)
 
     ESP_ERROR_CHECK(msg_router_start());
 
+    ESP_LOGI(TAG, "===== GPIO pin assignments =====");
+    ESP_LOGI(TAG, "  UART Radio : TX = GPIO%d, RX = GPIO%d (UART%d)",
+             CONFIG_UART_RADIO_TX_GPIO, CONFIG_UART_RADIO_RX_GPIO,
+             CONFIG_UART_RADIO_NUM);
+    ESP_LOGI(TAG, "  UART Lora  : TX = GPIO%d, RX = GPIO%d (UART%d @%d bps)",
+             CONFIG_UART_LORA_TX_GPIO, CONFIG_UART_LORA_RX_GPIO,
+             CONFIG_UART_LORA_NUM, CONFIG_UART_LORA_BAUDRATE);
+    ESP_LOGI(TAG, "  USB Host   : D+ / D- on internal USB PHY (ESP32-S3)");
+    ESP_LOGI(TAG, "=================================");
     ESP_LOGI(TAG, "Bridge up: USB CDC + BLE + UART Radio + UART Lora");
 }
